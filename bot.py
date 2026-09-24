@@ -25,6 +25,23 @@ from telegram.ext import (
 )
 
 # ============================================================
+# 2. DANS bot.py
+# REMPLACE L'IMPORT DE config PAR CELUI-CI
+# ============================================================
+
+from config import (
+    BOT_TOKEN,
+    NEXA_CHANNEL,
+    NEXA_URL,
+    ADMIN_IDS,
+    TEMP_ROOT,
+    MAX_DOWNLOAD_BYTES,
+    MAX_PROCESS_SECONDS,
+    TELEGRAM_API_BASE_URL,
+    TELEGRAM_API_FILE_BASE_URL,
+)
+
+# ============================================================
 # DASH FILEBOT
 # CREATED BY NEXA
 # ============================================================
@@ -684,7 +701,12 @@ async def menu_command(update, context):
 # ============================================================
 
 
+   # ============================================================
+# 3. REMPLACE LA FONCTION receive_file()
+# ============================================================
+
 async def receive_file(update, context):
+
     save_user(update.effective_user)
 
     message = update.message
@@ -695,16 +717,10 @@ async def receive_file(update, context):
     if not data:
         return
 
-    if data["size"] > MAX_DOWNLOAD_BYTES:
-        await message.reply_text(
-            "⚠️ <b>Fichier trop volumineux</b>\n\n"
-            f"Limite actuelle : "
-            f"<b>{format_size(MAX_DOWNLOAD_BYTES)}</b>\n\n"
-            "Cette limite dépend du serveur Telegram Bot API "
-            "utilisé par Dash.",
-            parse_mode="HTML"
-        )
-        return
+    # Ne bloque plus automatiquement à 20 MB.
+    # Si un Bot API cloud est utilisé et que Telegram refuse
+    # le téléchargement d'un gros fichier, l'erreur sera traitée
+    # proprement plus bas.
 
     sessions[user_id] = {
         **data,
@@ -718,7 +734,7 @@ async def receive_file(update, context):
 
     text = (
         "╭────────────────────────╮\n"
-        "│      ⚡ <b>DASH</b>         │\n"
+        "│       ⚡ <b>DASH</b>        │\n"
         "╰────────────────────────╯\n\n"
         f"📄 <b>Nom :</b> "
         f"<code>{safe_filename(data['name'])}</code>\n"
@@ -745,7 +761,8 @@ async def receive_file(update, context):
         )
 
     text += (
-        "\nChoisis ce que tu veux faire :"
+        "\n━━━━━━━━━━━━━━━━━━\n"
+        "Choisis une action :"
     )
 
     await message.reply_text(
@@ -753,7 +770,6 @@ async def receive_file(update, context):
         parse_mode="HTML",
         reply_markup=file_keyboard(data)
     )
-
 
 # ============================================================
 # RECEIVE PHOTO AS THUMBNAIL
