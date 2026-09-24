@@ -92,29 +92,30 @@ WEBHOOK_PATH = os.getenv(
 
 
 # ============================================================
-# FILES
+# 1. DANS config.py
+# REMPLACE LA PARTIE MAX_DOWNLOAD_BYTES PAR CECI
 # ============================================================
 
-TEMP_ROOT = os.getenv(
-    "TEMP_ROOT",
-    "/tmp"
-)
+TELEGRAM_API_BASE_URL = os.getenv(
+    "TELEGRAM_API_BASE_URL",
+    ""
+).strip()
 
+TELEGRAM_API_FILE_BASE_URL = os.getenv(
+    "TELEGRAM_API_FILE_BASE_URL",
+    ""
+).strip()
 
+# IMPORTANT :
+# Ne bloque plus les fichiers à 20 MB côté application.
+# La taille réellement possible dépend du Bot API utilisé.
 MAX_DOWNLOAD_BYTES = int(
     os.getenv(
         "MAX_DOWNLOAD_BYTES",
-        str(20 * 1024 * 1024)
+        str(2 * 1024 * 1024 * 1024)
     )
 )
 
-
-MAX_PROCESS_SECONDS = int(
-    os.getenv(
-        "MAX_PROCESS_SECONDS",
-        "1800"
-    )
-)
 
 
 # ============================================================
