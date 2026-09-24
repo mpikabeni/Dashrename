@@ -1,1 +1,3 @@
-python-telegram-bot[webhooks]==22.4
+python-telegram-bot[webhooks]==22.5
+boto3==1.40.30
+botocore==1.40.30
