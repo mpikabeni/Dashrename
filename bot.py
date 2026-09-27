@@ -213,6 +213,48 @@ def save_photo_thumbnail(update, file_id):
         )
 
 
+def current_thumbnail(uid):
+    with database() as db:
+        row = db.execute(
+            """
+            SELECT file_id
+            FROM photo_thumbnails
+            WHERE user_id=?
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (uid,),
+        ).fetchone()
+    return row[0] if row else None
+
+
+async def show_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    file_id = current_thumbnail(uid)
+    if not file_id:
+        await update.effective_message.reply_text(
+            "🖼️ Aucune miniature permanente enregistrée."
+        )
+        return
+    await update.effective_message.reply_photo(
+        photo=file_id,
+        caption="🖼️ <b>Miniature permanente actuelle</b>",
+        parse_mode="HTML",
+    )
+
+
+async def delete_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    with database() as db:
+        db.execute(
+            "DELETE FROM photo_thumbnails WHERE user_id=?",
+            (uid,),
+        )
+    await update.effective_message.reply_text(
+        "🗑️ Miniature permanente supprimée."
+    )
+
+
 def record_rename(uid, old_name, new_name):
     with database() as db:
         db.execute(
@@ -494,7 +536,8 @@ async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thumbnail = update.message.photo[0]
     item = update.message.photo[-1]
 
-    # Persist EVERY received photo as a thumbnail record.
+    # Every received photo is stored as its own thumbnail reference.
+    # The smallest PhotoSize is the thumbnail; the largest is the active file.
     save_photo_thumbnail(update, thumbnail.file_id)
 
     data = {
@@ -559,9 +602,17 @@ async def do_rename(
 ):
     uid = update.effective_user.id
     session = SESSIONS.get(uid)
+    message = update.effective_message
+
+    # This function is also called from an InlineKeyboard callback.
+    # In that case update.message is None. effective_message works for both
+    # normal messages and callback-query messages.
+    if not message:
+        log.error("No effective message available for rename | user=%s", uid)
+        return
 
     if not session:
-        await update.message.reply_text("⚠️ Aucun fichier actif.")
+        await message.reply_text("⚠️ Aucun fichier actif.")
         return
 
     if not await ensure_member(update, context):
@@ -569,7 +620,7 @@ async def do_rename(
 
     proposed = proposed.strip()
     if not proposed:
-        await update.message.reply_text(
+        await message.reply_text(
             "⚠️ Le nouveau nom ne peut pas être vide."
         )
         WAITING.add(uid)
@@ -577,7 +628,7 @@ async def do_rename(
 
     lock = LOCKS.setdefault(uid, asyncio.Lock())
     if lock.locked():
-        await update.message.reply_text(
+        await message.reply_text(
             "⏳ Un renommage est déjà en cours."
         )
         return
@@ -585,7 +636,7 @@ async def do_rename(
     async with lock:
         old_name = session["name"]
         name = renamed_name(old_name, proposed)
-        status = await update.message.reply_text(
+        status = await message.reply_text(
             "⏳ Téléchargement et renommage en cours…"
         )
 
@@ -660,12 +711,12 @@ async def do_rename(
                     )
 
                     if output_mode == "video" and session.get("kind") == "video":
-                        await update.message.reply_video(
+                        await message.reply_video(
                             video=file,
                             **common,
                         )
                     else:
-                        await update.message.reply_document(
+                        await message.reply_document(
                             document=file,
                             **common,
                         )
@@ -1107,6 +1158,8 @@ async def post_init(app: Application):
             BotCommand("menu", "Menu"),
             BotCommand("rename", "Renommer"),
             BotCommand("history", "Historique"),
+            BotCommand("showthumb", "Voir la miniature"),
+            BotCommand("delthumb", "Supprimer la miniature"),
             BotCommand("settings", "Paramètres"),
             BotCommand("status", "Statut"),
             BotCommand("about", "À propos"),
@@ -1172,6 +1225,8 @@ def main():
         ("menu", menu),
         ("rename", rename),
         ("history", history),
+        ("showthumb", show_thumbnail),
+        ("delthumb", delete_thumbnail),
         ("settings", settings),
         ("status", status),
         ("about", about),
