@@ -1,53 +1,49 @@
 #!/bin/sh
-set -eu
+set -e
 
-: "${TELEGRAM_API_ID:?TELEGRAM_API_ID est obligatoire pour le Local Bot API}"
-: "${TELEGRAM_API_HASH:?TELEGRAM_API_HASH est obligatoire pour le Local Bot API}"
-: "${BOT_TOKEN:?BOT_TOKEN est obligatoire}"
+echo "=========================================="
+echo "🚀 Démarrage de Dash Renamer"
+echo "=========================================="
 
-mkdir -p /app/data /app/telegram-data /app/telegram-tmp
+mkdir -p /app/telegram-data
+mkdir -p /app/telegram-tmp
+mkdir -p /app/telegram-files
+mkdir -p /app/data
 
-echo "[Dash] Démarrage du Telegram Local Bot API..."
+chmod 777 /app/telegram-data
+chmod 777 /app/telegram-tmp
+chmod 777 /app/telegram-files
+chmod 777 /app/data
+
+echo "📁 Dossiers Telegram préparés."
+
+echo "🚀 Démarrage du Telegram Local Bot API..."
 
 telegram-bot-api \
-  --api-id="$TELEGRAM_API_ID" \
-  --api-hash="$TELEGRAM_API_HASH" \
-  --local \
-  --http-port=8081 \
   --dir=/app/telegram-data \
+  --files-dir=/app/telegram-files \
   --temp-dir=/app/telegram-tmp \
-  > /app/telegram-api.log 2>&1 &
+  --http-port=8081 \
+  --local &
 
-API_PID=$!
+TELEGRAM_PID=$!
 
-cleanup() {
-  echo "[Dash] Arrêt du Local Bot API..."
-  kill "$API_PID" 2>/dev/null || true
-}
-trap cleanup INT TERM EXIT
+echo "⏳ Attente du Local Bot API..."
 
-for i in $(seq 1 60); do
-  if curl -fsS http://127.0.0.1:8081/bot"$BOT_TOKEN"/getMe >/tmp/dash-getme.json 2>/dev/null; then
-    echo "[Dash] Local Bot API prêt."
-    break
-  fi
-  if ! kill -0 "$API_PID" 2>/dev/null; then
-    echo "[Dash] Le Local Bot API s'est arrêté. Logs :"
-    cat /app/telegram-api.log || true
-    exit 1
-  fi
-  sleep 1
+for i in $(seq 1 30); do
+    if wget -q -O /dev/null http://127.0.0.1:8081/ 2>/dev/null; then
+        echo "✅ Local Bot API prêt."
+        break
+    fi
+
+    sleep 1
 done
 
-if ! curl -fsS http://127.0.0.1:8081/bot"$BOT_TOKEN"/getMe >/tmp/dash-getme.json 2>/dev/null; then
-  echo "[Dash] Impossible de joindre le Local Bot API après 60 secondes."
-  cat /app/telegram-api.log || true
-  exit 1
+if ! kill -0 "$TELEGRAM_PID" 2>/dev/null; then
+    echo "❌ Le Local Bot API n'a pas démarré."
+    exit 1
 fi
 
-export TELEGRAM_LOCAL_API=true
-export TELEGRAM_API_BASE_URL="http://127.0.0.1:8081/bot"
-export TELEGRAM_API_FILE_BASE_URL="http://127.0.0.1:8081/file/bot"
+echo "🤖 Démarrage de Dash Renamer..."
 
-echo "[Dash] Démarrage du bot Dash Renamer..."
-python3 bot.py
+exec python bot.py
