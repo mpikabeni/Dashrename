@@ -1,50 +1,87 @@
-# Dash Renamer
+# Dash Renamer — Local Bot API
 
-Bot Telegram de NEXA dédié au renommage de fichiers.
+Version prête pour Render avec le **Telegram Local Bot API Server** intégré.
 
-## Fonctions
+Cette version reste un renamer : pas de compression, pas de découpage et pas de conversion.
 
-- Renommer
-- Informations du fichier
-- Historique
-- Vérification du canal NEXA
-- Administration
-- Diffusion
-- Stockage temporaire Backblaze B2
-- `dash.png` affiché au `/start`
+## Pourquoi le Local Bot API ?
 
-## Fonctions volontairement absentes
+L’API Bot officielle limite le téléchargement des fichiers à 20 Mo. Le Local Bot API en mode `--local` permet de télécharger les fichiers sans cette limite et d’envoyer des fichiers jusqu’à 2000 Mo.
 
-- Pas de compression
-- Pas de conversion
-- Pas de découpage
-- Pas d'extraction audio
-- Pas de limite de taille ajoutée par le code Dash
+## 1. Variables Render
 
-## Installation Render
+Ajoute ces variables dans Render :
 
-Variables minimales :
-
-```env
-BOT_TOKEN=...
-ADMIN_IDS=...
+```text
+BOT_TOKEN=TON_NOUVEAU_TOKEN
+ADMIN_IDS=TON_ID_TELEGRAM
 NEXA_CHANNEL=@Nexa_CG
 NEXA_CHANNEL_URL=https://t.me/Nexa_CG
-TELEGRAM_LOCAL_API=false
-DB_PATH=/app/data/dash.sqlite3
-```
 
-Pour B2, remplir les quatre variables :
+TELEGRAM_API_ID=TON_API_ID
+TELEGRAM_API_HASH=TON_API_HASH
+TELEGRAM_LOCAL_API=true
+TELEGRAM_API_BASE_URL=http://127.0.0.1:8081/bot
+TELEGRAM_API_FILE_BASE_URL=http://127.0.0.1:8081/file/bot
 
-```env
 B2_BUCKET=...
 B2_ENDPOINT=...
 B2_KEY_ID=...
 B2_APPLICATION_KEY=...
+B2_PREFIX=dash-renamer
+B2_RETENTION=false
+
+DB_PATH=/app/data/dash.sqlite3
+WEBHOOK_PATH=telegram
+PORT=10000
 ```
 
-Ne jamais mettre un token Telegram ou une clé B2 dans GitHub.
+`TELEGRAM_API_ID` et `TELEGRAM_API_HASH` viennent de `my.telegram.org`. Le serveur Local Bot API les utilise pour se connecter à Telegram.
 
-## Important pour les gros fichiers
+## 2. Important : déconnecter le bot de l’API officielle
 
-Le code Dash n'impose aucune limite applicative de 20 Mo. Les limites éventuelles de téléchargement/envoi restent celles de l'API Telegram utilisée. Backblaze B2 sert de stockage et ne transforme pas à lui seul l'API Telegram officielle en Local Bot API.
+Telegram indique qu’avant de déplacer un bot vers un serveur Local Bot API, il faut appeler la méthode `logOut` sur l’API officielle. Fais-le **une seule fois**, avec ton nouveau token :
+
+```text
+https://api.telegram.org/botTON_NOUVEAU_TOKEN/logOut
+```
+
+Tu dois obtenir une réponse JSON avec `"ok":true`. Ne publie jamais ton token dans un dépôt GitHub ou dans une conversation.
+
+## 3. Déploiement Render
+
+1. Mets tous les fichiers du ZIP dans ton dépôt GitHub `Dashrename`.
+2. Sur Render, crée/redéploie le service Docker.
+3. Ajoute les variables ci-dessus.
+4. Lance un nouveau deploy.
+5. Dans les logs, tu dois voir :
+
+```text
+[Dash] Démarrage du Telegram Local Bot API...
+[Dash] Local Bot API prêt.
+[Dash] Démarrage du bot Dash Renamer...
+```
+
+## 4. Test
+
+Envoie d’abord un petit fichier. Puis teste un fichier de 264 Mo.
+
+Pour un fichier de 264 Mo, le téléchargement doit maintenant passer par :
+
+```text
+Telegram
+   ↓
+Local Bot API :8081
+   ↓
+Dash Renamer
+   ↓
+Renommage
+   ↓
+Retour Telegram
+```
+
+Le serveur Local Bot API est lancé dans le même conteneur que Dash, donc `127.0.0.1:8081` est volontairement utilisé.
+
+## 5. Stockage
+
+Le Local Bot API utilise `/app/telegram-data` et `/app/telegram-tmp`. Pour des fichiers très volumineux ou une utilisation importante, prévois un stockage persistant suffisamment grand sur ton hébergement.
