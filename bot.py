@@ -482,24 +482,34 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Exactly one photo handler.
-    # The DB claim prevents the same Telegram message from being processed
-    # twice, even if Telegram retries the update or the app sees a duplicate.
+    # Every Telegram photo contains several PhotoSize objects. The smallest
+    # one is kept as the thumbnail reference; the largest one is used for
+    # the actual rename/download operation.
     if not update.message or not update.message.photo:
         return
 
     if not claim_message(update):
         return
 
+    thumbnail = update.message.photo[0]
     item = update.message.photo[-1]
-    save_photo_thumbnail(update, item.file_id)
+
+    # Persist EVERY received photo as a thumbnail record.
+    save_photo_thumbnail(update, thumbnail.file_id)
 
     data = {
+        # Largest PhotoSize = actual image to rename/send.
         "file_id": item.file_id,
         "name": "photo.jpg",
         "size": item.file_size or 0,
         "kind": "photo",
         "duration": None,
-        "thumbnail_file_id": item.file_id,
+
+        # Smallest PhotoSize = persistent thumbnail reference.
+        "thumbnail_file_id": thumbnail.file_id,
+        "thumbnail_size": thumbnail.file_size or 0,
+        "thumbnail_width": thumbnail.width,
+        "thumbnail_height": thumbnail.height,
         "thumbnail_saved": True,
     }
 
@@ -531,6 +541,8 @@ async def rename(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if await ensure_member(update, context):
+        SESSIONS[uid].pop("pending_name", None)
+        SESSIONS[uid].pop("output_mode", None)
         WAITING.add(uid)
         await update.message.reply_text(
             "✏️ <b>Renommer le fichier</b>\n\n"
@@ -586,21 +598,8 @@ async def do_rename(
                 target = Path(directory) / name
 
                 # 1) Download from Telegram / Local Bot API.
-                log.info(
-                    "Download start | uid=%s | size=%s | local_api=%s | file_id=%s",
-                    uid,
-                    session.get("size", 0),
-                    LOCAL,
-                    session.get("file_id"),
-                )
                 tg_file = await context.bot.get_file(session["file_id"])
                 await tg_file.download_to_drive(custom_path=source)
-                log.info(
-                    "Download complete | uid=%s | bytes=%s | path=%s",
-                    uid,
-                    source.stat().st_size if source.exists() else 0,
-                    source,
-                )
 
                 if not source.exists():
                     raise RuntimeError(
@@ -629,20 +628,25 @@ async def do_rename(
                         b2_key,
                     )
 
-                # 4) Telegram delivery is the real success criterion.
-                await status.edit_text(
-                    "📤 Envoi du fichier renommé…"
-                )
+                # 4) Modern processing animation.
+                # The animation is only UI feedback; no conversion is done.
+                frames = [
+                    "⏳ <b>Préparation</b> · ░░░░░░░░░░",
+                    "⚙️ <b>Renommage</b> · ███░░░░░░░",
+                    "☁️ <b>Finalisation</b> · ██████░░░░",
+                    "📤 <b>Envoi</b> · █████████░",
+                ]
+                for frame in frames:
+                    try:
+                        await status.edit_text(frame, parse_mode="HTML")
+                    except TelegramError:
+                        pass
+                    await asyncio.sleep(0.35)
 
-                log.info(
-                    "Telegram upload start | uid=%s | bytes=%s | local_api=%s",
-                    uid,
-                    target.stat().st_size,
-                    LOCAL,
-                )
+                output_mode = session.get("output_mode", "document")
+
                 with target.open("rb") as file:
-                    await update.message.reply_document(
-                        document=file,
+                    common = dict(
                         filename=name,
                         caption=(
                             "✅ <b>Renommage terminé</b>\n"
@@ -654,69 +658,50 @@ async def do_rename(
                         connect_timeout=60,
                         pool_timeout=60,
                     )
-                log.info("Telegram upload complete | uid=%s | name=%s", uid, name)
+
+                    if output_mode == "video" and session.get("kind") == "video":
+                        await update.message.reply_video(
+                            video=file,
+                            **common,
+                        )
+                    else:
+                        await update.message.reply_document(
+                            document=file,
+                            **common,
+                        )
 
             # Telegram successfully received the renamed file.
             record_rename(uid, old_name, name)
             SESSIONS[uid] = {**session, "name": name}
 
+            mode_label = "🎬 Vidéo" if session.get("output_mode") == "video" else "📄 Document"
+
             if B2_ENABLED and not b2_uploaded:
                 await status.edit_text(
-                    "✅ Renommage terminé !\n"
-                    "⚠️ B2 n'a pas pu enregistrer une copie."
+                    "✨ <b>Opération terminée</b>\n\n"
+                    f"📁 <code>{html.escape(name)}</code>\n"
+                    f"📤 Format d'envoi : {mode_label}\n"
+                    "⚠️ B2 n'a pas pu enregistrer une copie.",
+                    parse_mode="HTML",
                 )
             else:
                 await status.edit_text(
-                    "✅ Renommage terminé !"
+                    "✨ <b>Opération terminée</b>\n\n"
+                    f"📁 <code>{html.escape(name)}</code>\n"
+                    f"📤 Format d'envoi : {mode_label}",
+                    parse_mode="HTML",
                 )
 
-        except Exception as exc:
-            # Do not hide the real error. This is especially important for
-            # large files where an official-Bot-API 20/50 MB limit, a Local
-            # Bot API connection problem, or a B2 configuration error can be
-            # the actual cause.
-            log.exception(
-                "Rename failed | uid=%s | old=%r | new=%r | local_api=%s | "
-                "b2=%s | error=%s",
-                uid,
-                old_name if "old_name" in locals() else None,
-                name if "name" in locals() else None,
-                LOCAL,
-                B2_ENABLED,
-                exc,
-            )
-
-            error_text = str(exc).strip() or exc.__class__.__name__
-            if len(error_text) > 900:
-                error_text = error_text[:900] + "…"
-
-            if not LOCAL and session.get("size", 0) > 20 * 1024 * 1024:
-                message_text = (
-                    "❌ <b>Échec du renommage.</b>\n\n"
-                    "📦 Ce fichier dépasse 20 Mo.\n"
-                    "Pour les gros fichiers, <b>Local Bot API</b> doit être "
-                    "activé et réellement connecté au bot.\n\n"
-                    f"🔎 <code>{html.escape(error_text)}</code>"
-                )
-            else:
-                message_text = (
-                    "❌ <b>Échec du renommage.</b>\n\n"
-                    f"🔎 <code>{html.escape(error_text)}</code>"
-                )
-
+        except Exception:
+            log.exception("Rename failed")
             try:
                 await status.edit_text(
-                    message_text,
+                    "❌ <b>Échec du renommage.</b>\n\n"
+                    "Consulte les journaux Render pour l'erreur exacte.",
                     parse_mode="HTML",
                 )
             except Exception:
-                try:
-                    await update.message.reply_text(
-                        message_text,
-                        parse_mode="HTML",
-                    )
-                except Exception:
-                    pass
+                pass
 
         finally:
             # Delete only an object that was actually uploaded.
@@ -762,11 +747,49 @@ async def text_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if uid in WAITING:
         WAITING.discard(uid)
-        await do_rename(
-            update,
-            context,
-            update.message.text.strip(),
+
+        session = SESSIONS.get(uid)
+        if not session:
+            await update.message.reply_text("⚠️ Aucun fichier actif.")
+            return
+
+        proposed = update.message.text.strip()
+        if not proposed:
+            await update.message.reply_text("⚠️ Le nouveau nom ne peut pas être vide.")
+            WAITING.add(uid)
+            return
+
+        session["pending_name"] = proposed
+        SESSIONS[uid] = session
+
+        # Modern, compact output selector.
+        await update.message.reply_text(
+            "🎯 <b>Nom enregistré</b>\n\n"
+            f"📁 <code>{html.escape(proposed)}</code>\n\n"
+            "📤 <b>Comment veux-tu recevoir le fichier ?</b>",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "📄 Document",
+                            callback_data="output:document",
+                        ),
+                        InlineKeyboardButton(
+                            "🎬 Vidéo",
+                            callback_data="output:video",
+                        ),
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            "❌ Annuler",
+                            callback_data="clear",
+                        ),
+                    ],
+                ]
+            ),
         )
+        return
 
 
 # ============================================================
@@ -863,6 +886,9 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📦 Type : {session['kind']}"
         )
 
+        if session.get("thumbnail_saved"):
+            text += "\n🖼️ Miniature : enregistrée"
+
         if session.get("duration"):
             text += f"\n⏱️ Durée : {session['duration']}s"
 
@@ -880,6 +906,50 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Envoie maintenant le nouveau nom.",
                 parse_mode="HTML",
             )
+            return
+
+    if action.startswith("output:"):
+        mode = action.split(":", 1)[1]
+        session = SESSIONS.get(uid)
+
+        if not session:
+            await query.message.reply_text("⚠️ Aucun fichier actif.")
+            return
+
+        if mode not in ("document", "video"):
+            return
+
+        # A video can be delivered either as a normal Telegram video
+        # or as a document. Other source types stay documents unless
+        # the user explicitly chooses video, in which case we explain
+        # that no conversion is performed.
+        if mode == "video" and session.get("kind") != "video":
+            await query.message.reply_text(
+                "⚠️ <b>Mode vidéo indisponible</b>\n\n"
+                "Dash ne convertit pas les fichiers. "
+                "Le mode 🎬 Vidéo est disponible uniquement pour une vidéo.",
+                parse_mode="HTML",
+            )
+            return
+
+        WAITING.discard(uid)
+        proposed = session.pop("pending_name", None)
+        if not proposed:
+            await query.message.reply_text(
+                "⚠️ Le nom à appliquer n'est plus disponible. "
+                "Appuie sur « Renommer » et recommence."
+            )
+            return
+
+        session["output_mode"] = mode
+        SESSIONS[uid] = session
+
+        await do_rename(
+            update,
+            context,
+            proposed,
+        )
+        return
 
 
 # ============================================================
