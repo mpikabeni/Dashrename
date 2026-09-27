@@ -586,8 +586,21 @@ async def do_rename(
                 target = Path(directory) / name
 
                 # 1) Download from Telegram / Local Bot API.
+                log.info(
+                    "Download start | uid=%s | size=%s | local_api=%s | file_id=%s",
+                    uid,
+                    session.get("size", 0),
+                    LOCAL,
+                    session.get("file_id"),
+                )
                 tg_file = await context.bot.get_file(session["file_id"])
                 await tg_file.download_to_drive(custom_path=source)
+                log.info(
+                    "Download complete | uid=%s | bytes=%s | path=%s",
+                    uid,
+                    source.stat().st_size if source.exists() else 0,
+                    source,
+                )
 
                 if not source.exists():
                     raise RuntimeError(
@@ -621,6 +634,12 @@ async def do_rename(
                     "📤 Envoi du fichier renommé…"
                 )
 
+                log.info(
+                    "Telegram upload start | uid=%s | bytes=%s | local_api=%s",
+                    uid,
+                    target.stat().st_size,
+                    LOCAL,
+                )
                 with target.open("rb") as file:
                     await update.message.reply_document(
                         document=file,
@@ -635,6 +654,7 @@ async def do_rename(
                         connect_timeout=60,
                         pool_timeout=60,
                     )
+                log.info("Telegram upload complete | uid=%s | name=%s", uid, name)
 
             # Telegram successfully received the renamed file.
             record_rename(uid, old_name, name)
@@ -650,16 +670,53 @@ async def do_rename(
                     "✅ Renommage terminé !"
                 )
 
-        except Exception:
-            log.exception("Rename failed")
+        except Exception as exc:
+            # Do not hide the real error. This is especially important for
+            # large files where an official-Bot-API 20/50 MB limit, a Local
+            # Bot API connection problem, or a B2 configuration error can be
+            # the actual cause.
+            log.exception(
+                "Rename failed | uid=%s | old=%r | new=%r | local_api=%s | "
+                "b2=%s | error=%s",
+                uid,
+                old_name if "old_name" in locals() else None,
+                name if "name" in locals() else None,
+                LOCAL,
+                B2_ENABLED,
+                exc,
+            )
+
+            error_text = str(exc).strip() or exc.__class__.__name__
+            if len(error_text) > 900:
+                error_text = error_text[:900] + "…"
+
+            if not LOCAL and session.get("size", 0) > 20 * 1024 * 1024:
+                message_text = (
+                    "❌ <b>Échec du renommage.</b>\n\n"
+                    "📦 Ce fichier dépasse 20 Mo.\n"
+                    "Pour les gros fichiers, <b>Local Bot API</b> doit être "
+                    "activé et réellement connecté au bot.\n\n"
+                    f"🔎 <code>{html.escape(error_text)}</code>"
+                )
+            else:
+                message_text = (
+                    "❌ <b>Échec du renommage.</b>\n\n"
+                    f"🔎 <code>{html.escape(error_text)}</code>"
+                )
+
             try:
                 await status.edit_text(
-                    "❌ <b>Échec du renommage.</b>\n\n"
-                    "Consulte les journaux Render pour l'erreur exacte.",
+                    message_text,
                     parse_mode="HTML",
                 )
             except Exception:
-                pass
+                try:
+                    await update.message.reply_text(
+                        message_text,
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
 
         finally:
             # Delete only an object that was actually uploaded.
