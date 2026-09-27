@@ -1,10 +1,6 @@
 __pycache__/
-*.py[cod]
+*.pyc
 .env
-.venv/
-venv/
-env/
-instance/
-tmp/
-temp/
-*.log
+data/
+*.sqlite3
+*.db
