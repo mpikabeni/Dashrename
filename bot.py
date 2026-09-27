@@ -161,6 +161,38 @@ def b2_client():
     )
 
 
+async def b2_upload_safe(path: Path, key: str) -> bool:
+    """Upload to B2 without ever blocking a successful Telegram rename."""
+    if not B2_ENABLED:
+        return False
+    try:
+        await asyncio.to_thread(
+            b2_client().upload_file,
+            str(path),
+            B2_BUCKET,
+            key,
+        )
+        log.info("B2 upload OK: %s", key)
+        return True
+    except Exception:
+        log.exception("B2 upload failed; rename will continue")
+        return False
+
+
+async def b2_delete_safe(key: str):
+    if not B2_ENABLED or not key:
+        return
+    try:
+        await asyncio.to_thread(
+            b2_client().delete_object,
+            Bucket=B2_BUCKET,
+            Key=key,
+        )
+        log.info("B2 cleanup OK: %s", key)
+    except Exception:
+        log.exception("B2 cleanup failed; renamed file was already sent")
+
+
 # ============================================================
 # FILE HELPERS
 # ============================================================
@@ -332,17 +364,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # IMPORTANT : aucune limite de taille n'est appliquée par Dash.
 # ============================================================
 
-async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = file_info(update.message)
-    if not data:
-        return
-
+async def _store_session(update: Update, data: dict):
     uid = update.effective_user.id
     record_user(uid)
-
-    # AUCUN contrôle MAX_DOWNLOAD_BYTES ici.
-    # Dash ne bloque donc pas les fichiers à 20 Mo.
-
     SESSIONS[uid] = data
     WAITING.discard(uid)
 
@@ -356,6 +380,35 @@ async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML",
         reply_markup=file_menu(),
     )
+
+
+async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Documents/videos/audios/voices/animations only.
+    # PHOTO is intentionally excluded so it cannot be processed twice.
+    data = file_info(update.message)
+    if not data:
+        return
+    await _store_session(update, data)
+
+
+async def receive_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # One and only one photo handler. The Telegram photo file_id is kept
+    # as the active thumbnail reference as well as the current image file.
+    if not update.message.photo:
+        return
+
+    item = update.message.photo[-1]
+    data = {
+        "file_id": item.file_id,
+        "name": "photo.jpg",
+        "size": item.file_size or 0,
+        "kind": "photo",
+        "duration": None,
+        "thumbnail_file_id": item.file_id,
+        "thumbnail_saved": True,
+    }
+
+    await _store_session(update, data)
 
 
 # ============================================================
@@ -408,7 +461,6 @@ async def do_rename(
         return
 
     proposed = proposed.strip()
-
     if not proposed:
         await update.message.reply_text(
             "⚠️ Le nouveau nom ne peut pas être vide."
@@ -417,7 +469,6 @@ async def do_rename(
         return
 
     lock = LOCKS.setdefault(uid, asyncio.Lock())
-
     if lock.locked():
         await update.message.reply_text(
             "⏳ Un renommage est déjà en cours."
@@ -425,46 +476,56 @@ async def do_rename(
         return
 
     async with lock:
-        name = renamed_name(session["name"], proposed)
+        old_name = session["name"]
+        name = renamed_name(old_name, proposed)
         status = await update.message.reply_text(
             "⏳ Téléchargement et renommage en cours…"
         )
 
         b2_key = None
+        b2_uploaded = False
 
         try:
             with tempfile.TemporaryDirectory(prefix="dash_") as directory:
-                source = Path(directory) / safe_name(session["name"])
+                source = Path(directory) / safe_name(old_name)
                 target = Path(directory) / name
 
+                # 1) Download from Telegram / Local Bot API.
                 tg_file = await context.bot.get_file(session["file_id"])
                 await tg_file.download_to_drive(custom_path=source)
 
+                if not source.exists():
+                    raise RuntimeError(
+                        "Le téléchargement Telegram a échoué."
+                    )
+
+                # 2) Rename locally. No conversion/compression.
                 if source != target:
                     source.rename(target)
 
-                # B2 : stockage temporaire si configuré.
+                if not target.exists():
+                    raise RuntimeError(
+                        "Le fichier renommé n'existe pas."
+                    )
+
+                # 3) B2 is optional. A bad B2 key/network must NOT make
+                #    Telegram rename fail.
                 if B2_ENABLED:
                     b2_key = (
                         f"{B2_PREFIX}/{uid}/"
                         f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}/"
                         f"{name}"
                     )
-
-                    await asyncio.to_thread(
-                        b2_client().upload_file,
-                        str(target),
-                        B2_BUCKET,
+                    b2_uploaded = await b2_upload_safe(
+                        target,
                         b2_key,
                     )
 
-                    log.info("Fichier envoyé vers B2 : %s", b2_key)
-
+                # 4) Telegram delivery is the real success criterion.
                 await status.edit_text(
                     "📤 Envoi du fichier renommé…"
                 )
 
-                # Envoi en document pour conserver le nom exact.
                 with target.open("rb") as file:
                     await update.message.reply_document(
                         document=file,
@@ -480,10 +541,19 @@ async def do_rename(
                         pool_timeout=60,
                     )
 
-            record_rename(uid, session["name"], name)
+            # Telegram successfully received the renamed file.
+            record_rename(uid, old_name, name)
             SESSIONS[uid] = {**session, "name": name}
 
-            await status.edit_text("✅ Renommage terminé !")
+            if B2_ENABLED and not b2_uploaded:
+                await status.edit_text(
+                    "✅ Renommage terminé !\n"
+                    "⚠️ B2 n'a pas pu enregistrer une copie."
+                )
+            else:
+                await status.edit_text(
+                    "✅ Renommage terminé !"
+                )
 
         except Exception:
             log.exception("Rename failed")
@@ -497,16 +567,9 @@ async def do_rename(
                 pass
 
         finally:
-            if b2_key and not B2_RETENTION:
-                try:
-                    await asyncio.to_thread(
-                        b2_client().delete_object,
-                        Bucket=B2_BUCKET,
-                        Key=b2_key,
-                    )
-                    log.info("Objet B2 supprimé : %s", b2_key)
-                except Exception:
-                    log.exception("B2 cleanup failed")
+            # Delete only an object that was actually uploaded.
+            if b2_uploaded and b2_key and not B2_RETENTION:
+                await b2_delete_safe(b2_key)
 
 
 # ============================================================
@@ -871,6 +934,11 @@ def main():
         )
 
     app = builder.build()
+    log.info(
+        "Dash ready | Local API=%s | B2=%s | Photo handler=single",
+        LOCAL,
+        B2_ENABLED,
+    )
 
     commands = [
         ("start", start),
@@ -890,18 +958,28 @@ def main():
 
     app.add_handler(CallbackQueryHandler(callback))
 
+    # Non-photo files. PHOTO is handled by exactly one dedicated handler.
     app.add_handler(
         MessageHandler(
             (
                 filters.Document.ALL
                 | filters.VIDEO
                 | filters.AUDIO
-                | filters.PHOTO
                 | filters.VOICE
                 | filters.ANIMATION
             ),
             receive_file,
-        )
+        ),
+        group=0,
+    )
+
+    # Photos are handled exactly once and also stored as a thumbnail reference.
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO,
+            receive_photo,
+        ),
+        group=0,
     )
 
     app.add_handler(
