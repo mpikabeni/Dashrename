@@ -85,3 +85,18 @@ Le serveur Local Bot API est lancé dans le même conteneur que Dash, donc `127.
 ## 5. Stockage
 
 Le Local Bot API utilise `/app/telegram-data` et `/app/telegram-tmp`. Pour des fichiers très volumineux ou une utilisation importante, prévois un stockage persistant suffisamment grand sur ton hébergement.
+
+## Local Bot API pour les gros fichiers
+
+Cette image utilise `aiogram/telegram-bot-api` comme image de base. Cette image contient le binaire officiel Telegram Bot API à `/usr/local/bin/telegram-bot-api`; le projet Dash réinitialise explicitement l'entrypoint hérité afin de lancer le serveur local puis le bot Python.
+
+Le mode `--local` permet le téléchargement des fichiers sans la limite de 20 Mo de l'API officielle et l'upload jusqu'à 2000 Mo, selon la documentation Telegram. Le serveur local nécessite `TELEGRAM_API_ID` et `TELEGRAM_API_HASH` obtenus sur `my.telegram.org`.
+
+Variables Render minimales :
+
+- `BOT_TOKEN`
+- `TELEGRAM_API_ID`
+- `TELEGRAM_API_HASH`
+- `TELEGRAM_LOCAL_API=true`
+
+Le `start.sh` vérifie que le binaire existe, prépare les dossiers, démarre le Local Bot API, attend son `getMe`, puis démarre Dash.
