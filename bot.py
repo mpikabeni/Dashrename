@@ -189,82 +189,28 @@ def claim_message(update):
 
 
 def save_photo_thumbnail(update, file_id):
-    """Save the latest photo as the user's permanent thumbnail."""
+    """Persist the Telegram photo file_id as the bot's thumbnail reference."""
     message = update.effective_message
     chat = update.effective_chat
     user = update.effective_user
     if not message or not chat or not user:
         return
 
-    now = datetime.now(timezone.utc).isoformat()
     with database() as db:
-        # Keep the history/statistics row. The newest row is the active
-        # thumbnail for this user. A new photo therefore replaces the
-        # previous active thumbnail automatically.
         db.execute(
             """
             INSERT OR REPLACE INTO photo_thumbnails
             (chat_id, message_id, user_id, file_id, created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (chat.id, message.message_id, user.id, file_id, now),
+            (
+                chat.id,
+                message.message_id,
+                user.id,
+                file_id,
+                datetime.now(timezone.utc).isoformat(),
+            ),
         )
-
-
-def current_thumbnail(uid):
-    """Return the newest permanent thumbnail file_id for a user."""
-    with database() as db:
-        row = db.execute(
-            """
-            SELECT file_id
-            FROM photo_thumbnails
-            WHERE user_id=?
-            ORDER BY created_at DESC, message_id DESC
-            LIMIT 1
-            """,
-            (uid,),
-        ).fetchone()
-    return row[0] if row else None
-
-
-async def download_current_thumbnail(context, uid, directory):
-    """Download the saved Telegram photo to a temporary JPEG file."""
-    file_id = current_thumbnail(uid)
-    if not file_id:
-        return None
-
-    path = Path(directory) / "dash_thumbnail.jpg"
-    try:
-        tg_file = await context.bot.get_file(
-            file_id,
-            read_timeout=120,
-            write_timeout=120,
-            connect_timeout=30,
-            pool_timeout=30,
-        )
-        await tg_file.download_to_drive(
-            custom_path=path,
-            read_timeout=120,
-            write_timeout=120,
-            connect_timeout=30,
-            pool_timeout=30,
-        )
-        if not path.exists() or path.stat().st_size <= 0:
-            return None
-        # Telegram requires a thumbnail to be a small JPEG. The smallest
-        # PhotoSize saved by receive_photo is normally already within the
-        # Telegram thumbnail limits. Do not send it if it is unexpectedly large.
-        if path.stat().st_size > 200 * 1024:
-            log.warning("Saved thumbnail is too large: %s bytes", path.stat().st_size)
-            return None
-        return path
-    except Exception:
-        log.exception("Unable to download permanent thumbnail | user=%s", uid)
-        return None
-
-
-def thumbnail_status(uid):
-    return "🖼️ Miniature permanente : ✅ enregistrée" if current_thumbnail(uid) else "🖼️ Miniature permanente : ❌ aucune"
 
 
 def record_rename(uid, old_name, new_name):
@@ -397,18 +343,23 @@ def file_info(message):
 # ============================================================
 
 def file_menu(uid=None):
+    thumb = current_thumbnail(uid) if uid is not None else None
+    thumb_label = (
+        "🖼️ Miniature : ✅ enregistrée"
+        if thumb
+        else "🖼️ Miniature : ❌ aucune"
+    )
     rows = [
         [
             InlineKeyboardButton("✏️ Renommer", callback_data="rename"),
             InlineKeyboardButton("ℹ️ Infos", callback_data="info"),
         ],
+        [
+            InlineKeyboardButton("🖼️ Voir miniature", callback_data="showthumb"),
+            InlineKeyboardButton("🗑️ Supprimer miniature", callback_data="delthumb"),
+        ],
+        [InlineKeyboardButton("🗑️ Annuler", callback_data="clear")],
     ]
-    if uid is not None:
-        rows.append([
-            InlineKeyboardButton("🖼️ Voir miniature", callback_data="thumb:show"),
-            InlineKeyboardButton("🗑️ Supprimer miniature", callback_data="thumb:delete"),
-        ])
-    rows.append([InlineKeyboardButton("🗑️ Annuler", callback_data="clear")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -512,12 +463,14 @@ async def _store_session(update: Update, data: dict):
     SESSIONS[uid] = data
     WAITING.discard(uid)
 
+    thumb = current_thumbnail(uid)
+    thumb_status = "🖼️ <b>Miniature permanente :</b> ✅ enregistrée" if thumb else "🖼️ <b>Miniature permanente :</b> ❌ aucune"
     await update.message.reply_text(
         (
             "📁 <b>Fichier reçu</b>\n\n"
             f"Nom : <code>{html.escape(data['name'])}</code>\n"
             f"Taille : {human_size(data['size'])}\n"
-            f"{thumbnail_status(uid)}\n\n"
+            f"{thumb_status}\n\n"
             "Choisis une action :"
         ),
         parse_mode="HTML",
@@ -582,7 +535,7 @@ async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if session:
         await update.message.reply_text(
             "📁 Ton dernier fichier :",
-            reply_markup=file_menu(update.effective_user.id),
+            reply_markup=file_menu(uid),
         )
     else:
         await update.message.reply_text(
@@ -616,17 +569,16 @@ async def do_rename(
 ):
     uid = update.effective_user.id
     session = SESSIONS.get(uid)
-    message = update.effective_message
     chat = update.effective_chat
 
-    # A callback query has update.message == None. Always use the effective
-    # message/chat so the rename button works from both messages and buttons.
-    if not message or not chat:
-        log.error("Rename update has no effective message/chat | user=%s", uid)
+    # CallbackQuery updates do NOT have update.message. Always use the
+    # effective chat/message so both buttons and normal messages work.
+    if not chat:
+        log.error("No effective chat for rename | user=%s", uid)
         return
 
     if not session:
-        await message.reply_text("⚠️ Aucun fichier actif.")
+        await chat.send_message("⚠️ Aucun fichier actif.")
         return
 
     if not await ensure_member(update, context):
@@ -634,19 +586,19 @@ async def do_rename(
 
     proposed = proposed.strip()
     if not proposed:
-        await message.reply_text("⚠️ Le nouveau nom ne peut pas être vide.")
+        await chat.send_message("⚠️ Le nouveau nom ne peut pas être vide.")
         WAITING.add(uid)
         return
 
     lock = LOCKS.setdefault(uid, asyncio.Lock())
     if lock.locked():
-        await message.reply_text("⏳ Un renommage est déjà en cours.")
+        await chat.send_message("⏳ Un renommage est déjà en cours.")
         return
 
     async with lock:
         old_name = session["name"]
         name = renamed_name(old_name, proposed)
-        status = await message.reply_text("⏳ Téléchargement du fichier…")
+        status = await chat.send_message("⏳ Téléchargement du fichier…")
         b2_key = None
         b2_uploaded = False
 
@@ -655,7 +607,8 @@ async def do_rename(
                 source = Path(directory) / safe_name(old_name)
                 target = Path(directory) / name
 
-                # Large-file friendly Telegram download timeouts.
+                # Large-file friendly timeouts. With Local Bot API this allows
+                # files far above Telegram's normal 20 MB download limit.
                 tg_file = await context.bot.get_file(
                     session["file_id"],
                     read_timeout=3600,
@@ -671,15 +624,10 @@ async def do_rename(
                     pool_timeout=120,
                 )
 
-                if not source.exists():
+                if not source.exists() or source.stat().st_size == 0:
                     raise RuntimeError("Le téléchargement Telegram a échoué.")
 
-                # Rename only: no conversion, no compression.
-                if source != target:
-                    source.rename(target)
-
-                if not target.exists():
-                    raise RuntimeError("Le fichier renommé n'existe pas.")
+                source.rename(target)
 
                 await status.edit_text(
                     "📤 <b>Envoi du fichier renommé…</b>\n"
@@ -687,58 +635,52 @@ async def do_rename(
                     parse_mode="HTML",
                 )
 
-                # Download the permanent thumbnail only when one exists.
-                # It is tiny compared with the main file.
+                # Download the user's CURRENT permanent thumbnail.
                 thumbnail_path = await download_current_thumbnail(
                     context, uid, directory
                 )
 
-                common = dict(
-                    filename=name,
-                    caption=(
-                        "✅ <b>Renommage terminé</b>\n"
-                        f"📁 <code>{html.escape(name)}</code>"
-                    ),
-                    parse_mode="HTML",
-                    read_timeout=3600,
-                    write_timeout=3600,
-                    connect_timeout=120,
-                    pool_timeout=120,
+                output_mode = session.get("output_mode", "document")
+                caption = (
+                    "✅ <b>Renommage terminé</b>\n"
+                    f"📁 <code>{html.escape(name)}</code>"
                 )
 
-                output_mode = session.get("output_mode", "document")
-
+                # Send first. B2 is secondary and can never block delivery.
                 with target.open("rb") as file:
                     if output_mode == "video" and session.get("kind") == "video":
-                        kwargs = dict(common)
-                        kwargs.pop("filename", None)
-                        if thumbnail_path:
+                        kwargs = {
+                            "video": file,
+                            "caption": caption,
+                            "parse_mode": "HTML",
+                            "supports_streaming": True,
+                            "read_timeout": 3600,
+                            "write_timeout": 3600,
+                            "connect_timeout": 120,
+                            "pool_timeout": 120,
+                        }
+                        if thumbnail_path and thumbnail_path.exists():
                             with thumbnail_path.open("rb") as thumb:
-                                await chat.send_video(
-                                    video=file,
-                                    thumbnail=thumb,
-                                    **kwargs,
-                                )
+                                await chat.send_video(thumbnail=thumb, **kwargs)
                         else:
-                            await chat.send_video(video=file, **kwargs)
+                            await chat.send_video(**kwargs)
                     else:
-                        kwargs = dict(common)
-                        if thumbnail_path:
+                        kwargs = {
+                            "document": file,
+                            "filename": name,
+                            "caption": caption,
+                            "parse_mode": "HTML",
+                            "read_timeout": 3600,
+                            "write_timeout": 3600,
+                            "connect_timeout": 120,
+                            "pool_timeout": 120,
+                        }
+                        if thumbnail_path and thumbnail_path.exists():
                             with thumbnail_path.open("rb") as thumb:
-                                await chat.send_document(
-                                    document=file,
-                                    thumbnail=thumb,
-                                    **kwargs,
-                                )
+                                await chat.send_document(thumbnail=thumb, **kwargs)
                         else:
-                            await chat.send_document(
-                                document=file,
-                                **kwargs,
-                            )
+                            await chat.send_document(**kwargs)
 
-                # Telegram already has the result. B2 is secondary and is
-                # deliberately done AFTER delivery so a bad B2 key cannot
-                # delay or break the rename.
                 if B2_ENABLED:
                     b2_key = (
                         f"{B2_PREFIX}/{uid}/"
@@ -748,48 +690,33 @@ async def do_rename(
                     b2_uploaded = await b2_upload_safe(target, b2_key)
 
             record_rename(uid, old_name, name)
-            SESSIONS[uid] = {
-                **session,
-                "name": name,
-                "pending_name": None,
-            }
+            SESSIONS[uid] = {**session, "name": name, "pending_name": None}
 
-            mode_label = (
-                "🎬 Vidéo"
-                if session.get("output_mode") == "video"
-                else "📄 Document"
-            )
-            thumb_label = (
-                "🖼️ Miniature : utilisée"
-                if current_thumbnail(uid)
-                else "🖼️ Miniature : aucune"
-            )
-
-            text = (
+            mode_label = "🎬 Vidéo" if output_mode == "video" else "📄 Document"
+            thumb_label = "🖼️ Miniature : utilisée" if current_thumbnail(uid) else "🖼️ Miniature : aucune"
+            result = (
                 "✨ <b>Opération terminée</b>\n\n"
                 f"📁 <code>{html.escape(name)}</code>\n"
                 f"📤 Format : {mode_label}\n"
                 f"{thumb_label}"
             )
             if B2_ENABLED and not b2_uploaded:
-                text += "\n⚠️ Copie B2 non enregistrée."
-
+                result += "\n⚠️ Copie B2 non enregistrée."
             try:
-                await status.edit_text(text, parse_mode="HTML")
+                await status.edit_text(result, parse_mode="HTML")
             except TelegramError:
                 pass
 
         except Exception as exc:
-            log.exception("Rename failed")
+            log.exception("Rename failed | user=%s", uid)
             try:
                 await status.edit_text(
-                    "❌ <b>Échec du renommage.</b>\n\n"
-                    f"<code>{html.escape(str(exc)[:1000])}</code>",
+                    "❌ <b>Échec du renommage</b>\n\n"
+                    f"<code>{html.escape(str(exc)[:1200])}</code>",
                     parse_mode="HTML",
                 )
             except Exception:
                 pass
-
         finally:
             if b2_uploaded and b2_key and not B2_RETENTION:
                 await b2_delete_safe(b2_key)
@@ -950,28 +877,6 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    if action == "thumb:show":
-        file_id = current_thumbnail(uid)
-        if not file_id:
-            await query.message.reply_text("🖼️ Aucune miniature permanente enregistrée.")
-            return
-        try:
-            await query.message.reply_photo(
-                photo=file_id,
-                caption="🖼️ <b>Miniature permanente actuelle</b>",
-                parse_mode="HTML",
-            )
-        except TelegramError:
-            log.exception("Unable to show thumbnail from callback | user=%s", uid)
-            await query.message.reply_text("⚠️ Impossible d'afficher la miniature.")
-        return
-
-    if action == "thumb:delete":
-        with database() as db:
-            db.execute("DELETE FROM photo_thumbnails WHERE user_id=?", (uid,))
-        await query.message.reply_text("🗑️ Miniature permanente supprimée.")
-        return
-
     session = SESSIONS.get(uid)
 
     if action == "clear":
@@ -994,7 +899,8 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📦 Type : {session['kind']}"
         )
 
-        text += "\n" + thumbnail_status(uid)
+        if session.get("thumbnail_saved"):
+            text += "\n🖼️ Miniature : enregistrée"
 
         if session.get("duration"):
             text += f"\n⏱️ Durée : {session['duration']}s"
@@ -1058,36 +964,47 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if action == "showthumb":
+        file_id = current_thumbnail(uid)
+        if not file_id:
+            await query.message.reply_text("🖼️ Aucune miniature permanente enregistrée.")
+            return
+        try:
+            await query.message.reply_photo(
+                photo=file_id,
+                caption="🖼️ <b>Miniature permanente actuelle</b>",
+                parse_mode="HTML",
+            )
+        except TelegramError as exc:
+            log.exception("Show thumbnail failed: %s", exc)
+            await query.message.reply_text("⚠️ Impossible d'afficher la miniature.")
+        return
+
+    if action == "delthumb":
+        with database() as db:
+            db.execute("DELETE FROM photo_thumbnails WHERE user_id=?", (uid,))
+        await query.message.reply_text("🗑️ Miniature permanente supprimée.")
+        return
+
 
 async def show_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     file_id = current_thumbnail(uid)
     if not file_id:
-        await update.effective_message.reply_text(
-            "🖼️ Aucune miniature permanente enregistrée."
-        )
+        await update.effective_message.reply_text("🖼️ Aucune miniature permanente enregistrée.")
         return
-
-    try:
-        await update.effective_chat.send_photo(
-            photo=file_id,
-            caption="🖼️ <b>Miniature permanente actuelle</b>",
-            parse_mode="HTML",
-        )
-    except TelegramError:
-        log.exception("Unable to show thumbnail | user=%s", uid)
-        await update.effective_message.reply_text(
-            "⚠️ La miniature est enregistrée mais Telegram ne permet pas de l'afficher actuellement."
-        )
+    await update.effective_chat.send_photo(
+        photo=file_id,
+        caption="🖼️ <b>Miniature permanente actuelle</b>",
+        parse_mode="HTML",
+    )
 
 
 async def delete_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     with database() as db:
         db.execute("DELETE FROM photo_thumbnails WHERE user_id=?", (uid,))
-    await update.effective_message.reply_text(
-        "🗑️ Miniature permanente supprimée. Tu peux en envoyer une nouvelle à tout moment."
-    )
+    await update.effective_message.reply_text("🗑️ Miniature permanente supprimée.")
 
 
 # ============================================================
@@ -1196,7 +1113,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "ℹ️ Informations\n"
             "📜 Historique\n\n"
             "/start /menu /rename /history /settings "
-            "/status /about /help /cancel /showthumb /delthumb"
+            "/status /about /help /cancel"
         ),
         parse_mode="HTML",
     )
@@ -1250,8 +1167,6 @@ async def post_init(app: Application):
             BotCommand("about", "À propos"),
             BotCommand("help", "Aide"),
             BotCommand("cancel", "Annuler"),
-            BotCommand("showthumb", "Voir la miniature"),
-            BotCommand("delthumb", "Supprimer la miniature"),
             BotCommand("admin", "Administration"),
         ]
     )
