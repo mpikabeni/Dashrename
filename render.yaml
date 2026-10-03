@@ -1,43 +1,19 @@
 services:
   - type: web
-    name: dashrename
+    name: dash-renamer
     runtime: docker
-    plan: free
-    autoDeploy: true
+    plan: starter
+    healthCheckPath: /
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: ADMIN_IDS
-        sync: false
-      - key: NEXA_CHANNEL
-        value: "@Nexa_CG"
-      - key: NEXA_CHANNEL_URL
-        value: "https://t.me/Nexa_CG"
       - key: TELEGRAM_API_ID
         sync: false
       - key: TELEGRAM_API_HASH
         sync: false
-      - key: TELEGRAM_LOCAL_API
-        value: "true"
-      - key: TELEGRAM_API_BASE_URL
-        value: "http://127.0.0.1:8081/bot"
-      - key: TELEGRAM_API_FILE_BASE_URL
-        value: "http://127.0.0.1:8081/file/bot"
-      - key: B2_BUCKET
-        sync: false
-      - key: B2_ENDPOINT
-        sync: false
-      - key: B2_KEY_ID
-        sync: false
-      - key: B2_APPLICATION_KEY
-        sync: false
-      - key: B2_PREFIX
-        value: "dash-renamer"
-      - key: B2_RETENTION
-        value: "false"
-      - key: DB_PATH
-        value: "/app/data/dash.sqlite3"
-      - key: WEBHOOK_PATH
-        value: "telegram"
-      - key: PORT
-        value: "10000"
+      - key: DATA_DIR
+        value: /app/data
+    disk:
+      name: dash-data
+      mountPath: /app/data
+      sizeGB: 10

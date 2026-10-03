@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -14,31 +15,26 @@ from telegram.ext import (
 )
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+PORT = int(os.getenv("PORT", "10000"))
 
-# 2 GiB. Telegram Local Bot API supports uploads up to 2000 MB.
-MAX_BYTES = 2 * 1024 * 1024 * 1024
+MAX_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
 DATA_DIR = Path(os.getenv("DATA_DIR", "/app/data"))
-TMP_DIR = DATA_DIR / "tmp"
+TMP_DIR = DATA_DIR / "jobs"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
-
 DB_PATH = DATA_DIR / "dash.sqlite3"
 
-LOCAL_API = os.getenv("TELEGRAM_LOCAL_API", "true").lower() in {"1", "true", "yes"}
-API_BASE_URL = os.getenv(
-    "TELEGRAM_API_BASE_URL", "http://127.0.0.1:8081/bot"
-)
-API_FILE_BASE_URL = os.getenv(
-    "TELEGRAM_API_FILE_BASE_URL",
-    "http://127.0.0.1:8081/file/bot",
-)
+# The Local Bot API and this bot run in the SAME container.
+# This is intentional: local_mode returns absolute file paths, so both
+# processes must see the same filesystem.
+API_BASE_URL = f"http://127.0.0.1:{PORT}/bot"
+API_FILE_BASE_URL = f"http://127.0.0.1:{PORT}/file/bot"
 
 VIDEO_EXTENSIONS = {
     ".mp4", ".mkv", ".webm", ".mov", ".avi", ".m4v", ".ts", ".flv"
 }
 
-# Short-lived in-memory sessions. The permanent thumbnail is stored in SQLite.
 sessions = {}
 
 
@@ -85,8 +81,8 @@ def get_thumbnail(user_id: int):
 
 def human_size(size: int) -> str:
     value = float(size)
-    for unit in ("B", "KB", "MB", "GB", "TB"):
-        if value < 1024 or unit == "TB":
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1024 or unit == "GB":
             return f"{value:.2f} {unit}"
         value /= 1024
     return f"{size} B"
@@ -97,17 +93,16 @@ def clean_name(name: str) -> str:
     return name[:240] or "file"
 
 
-def extension(name: str) -> str:
+def ext(name: str) -> str:
     suffix = Path(name).suffix
     return suffix[1:].upper() if suffix else "N/A"
 
 
-def is_video_document(name: str, mime: str) -> bool:
-    suffix = Path(name).suffix.lower()
-    return mime.startswith("video/") or suffix in VIDEO_EXTENSIONS
+def is_video(name: str, mime: str) -> bool:
+    return mime.startswith("video/") or Path(name).suffix.lower() in VIDEO_EXTENSIONS
 
 
-def get_media(message):
+def media_from_message(message):
     if message.video:
         m = message.video
         return {
@@ -131,29 +126,33 @@ def get_media(message):
     return None
 
 
-def action_keyboard(session_id: str):
+def first_keyboard(session_id: str):
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(
-                    "✏️ Renommer", callback_data=f"rename|{session_id}"
-                ),
-                InlineKeyboardButton(
-                    "ℹ️ Infos", callback_data=f"info|{session_id}"
-                ),
+                InlineKeyboardButton("✏️ Renommer", callback_data=f"rename:{session_id}"),
+                InlineKeyboardButton("ℹ️ Infos", callback_data=f"info:{session_id}"),
             ],
             [
-                InlineKeyboardButton(
-                    "📁 Document", callback_data=f"output|document|{session_id}"
-                ),
-                InlineKeyboardButton(
-                    "🎬 Vidéo", callback_data=f"output|video|{session_id}"
-                ),
+                InlineKeyboardButton("📁 Document", callback_data=f"output:document:{session_id}"),
+                InlineKeyboardButton("🎬 Vidéo", callback_data=f"output:video:{session_id}"),
             ],
             [
-                InlineKeyboardButton(
-                    "❌ Annuler", callback_data=f"cancel|{session_id}"
-                )
+                InlineKeyboardButton("❌ Annuler", callback_data=f"cancel:{session_id}")
+            ],
+        ]
+    )
+
+
+def output_keyboard(session_id: str):
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📁 Document", callback_data=f"output:document:{session_id}"),
+                InlineKeyboardButton("🎬 Vidéo", callback_data=f"output:video:{session_id}"),
+            ],
+            [
+                InlineKeyboardButton("❌ Annuler", callback_data=f"cancel:{session_id}")
             ],
         ]
     )
@@ -169,59 +168,50 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     photo = update.effective_message.photo[-1]
-
-    set_thumbnail(user_id, photo.file_id)
+    set_thumbnail(update.effective_user.id, photo.file_id)
 
     await update.effective_message.reply_text(
         "🖼️ MINIATURE ENREGISTRÉE\n\n"
         "Cette photo est maintenant ta miniature permanente.\n"
-        "Une prochaine photo la remplacera automatiquement."
+        "Une nouvelle photo la remplacera automatiquement."
     )
 
 
 async def media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-    media = get_media(message)
-
+    media = media_from_message(message)
     if not media:
         return
 
-    size = media["size"]
-
-    if size > MAX_BYTES:
+    if media["size"] > MAX_BYTES:
         await message.reply_text(
             "❌ FICHIER TROP VOLUMINEUX\n\n"
-            f"📦 Taille : {human_size(size)}\n"
-            "🚫 Maximum autorisé : 2.00 GB"
+            f"📦 Taille : {human_size(media['size'])}\n"
+            "🚫 Maximum : 2.00 GB"
         )
         return
 
-    session_id = f"{message.chat_id}:{message.message_id}"
-
+    session_id = uuid.uuid4().hex[:12]
     sessions[session_id] = {
         **media,
         "chat_id": message.chat_id,
         "user_id": update.effective_user.id,
         "waiting_name": False,
+        "new_name": media["name"],
         "created_at": time.time(),
+        "source_message_id": message.message_id,
     }
 
-    title = "🎬 MEDIA INFO" if media["kind"] == "video" else "📄 MEDIA INFO"
-
-    text = (
-        f"{title}\n\n"
-        f"📁 OLD FILE NAME\n{media['name']}\n\n"
-        f"🏷 EXTENSION\n{extension(media['name'])}\n\n"
-        f"💾 FILE SIZE\n{human_size(size)}\n\n"
-        f"🧬 MIME TYPE\n{media['mime']}\n\n"
-        "✏️ Choisis une action."
-    )
-
     await message.reply_text(
-        text,
-        reply_markup=action_keyboard(session_id),
+        ("🎬 MEDIA INFO" if media["kind"] == "video" else "📄 MEDIA INFO")
+        + "\n\n"
+        f"📁 OLD FILE NAME\n{media['name']}\n\n"
+        f"🏷 EXTENSION\n{ext(media['name'])}\n\n"
+        f"💾 FILE SIZE\n{human_size(media['size'])}\n\n"
+        f"🧬 MIME TYPE\n{media['mime']}\n\n"
+        "✏️ Choisis une action.",
+        reply_markup=first_keyboard(session_id),
     )
 
 
@@ -229,49 +219,31 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user_id = update.effective_user.id
 
-    pending = [
-        (sid, session)
-        for sid, session in sessions.items()
-        if session["user_id"] == user_id and session["waiting_name"]
+    candidates = [
+        (sid, s)
+        for sid, s in sessions.items()
+        if s["user_id"] == user_id and s["waiting_name"]
     ]
-
-    if not pending:
+    if not candidates:
         return
 
-    session_id, session = pending[-1]
+    session_id, session = candidates[-1]
     new_name = clean_name(message.text)
 
-    if "." not in new_name:
-        old_suffix = Path(session["name"]).suffix
-        new_name += old_suffix
+    # If the user doesn't provide an extension, preserve the original one.
+    if not Path(new_name).suffix:
+        suffix = Path(session["name"]).suffix
+        if suffix:
+            new_name += suffix
 
-    session["name"] = new_name
+    session["new_name"] = new_name
     session["waiting_name"] = False
 
     await message.reply_text(
         "🎯 NOM ENREGISTRÉ\n\n"
         f"📁 {new_name}\n\n"
         "📤 Comment veux-tu recevoir le fichier ?",
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton(
-                        "📁 Document",
-                        callback_data=f"output|document|{session_id}",
-                    ),
-                    InlineKeyboardButton(
-                        "🎬 Vidéo",
-                        callback_data=f"output|video|{session_id}",
-                    ),
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ Annuler",
-                        callback_data=f"cancel|{session_id}",
-                    )
-                ],
-            ]
-        ),
+        reply_markup=output_keyboard(session_id),
     )
 
 
@@ -279,155 +251,139 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    parts = query.data.split("|")
+    parts = query.data.split(":")
+    action = parts[0]
 
-    if parts[0] == "cancel":
+    if action == "cancel":
         session_id = parts[1]
         sessions.pop(session_id, None)
         await query.message.edit_text("❌ Opération annulée.")
         return
 
-    if parts[0] == "rename":
-        session_id = parts[1]
-        session = sessions.get(session_id)
+    if len(parts) < 2:
+        return
 
-        if not session:
-            await query.answer("Session expirée.", show_alert=True)
-            return
+    session_id = parts[-1]
+    session = sessions.get(session_id)
 
+    if not session:
+        await query.answer("Session expirée.", show_alert=True)
+        return
+
+    if action == "rename":
         session["waiting_name"] = True
-
         await query.message.reply_text(
             "✏️ PLEASE ENTER THE NEW FILE NAME\n\n"
             "Envoie maintenant le nouveau nom avec son extension."
         )
         return
 
-    if parts[0] == "info":
-        session_id = parts[1]
-        session = sessions.get(session_id)
-
-        if not session:
-            await query.answer("Session expirée.", show_alert=True)
-            return
-
+    if action == "info":
         await query.message.reply_text(
             "ℹ️ MEDIA INFO\n\n"
             f"📁 {session['name']}\n"
             f"💾 {human_size(session['size'])}\n"
-            f"🏷 {extension(session['name'])}\n"
+            f"🏷 {ext(session['name'])}\n"
             f"🧬 {session['mime']}"
         )
         return
 
-    if parts[0] == "output":
+    if action == "output":
         output = parts[1]
-        session_id = parts[2]
-        session = sessions.get(session_id)
 
-        if not session:
-            await query.answer("Session expirée.", show_alert=True)
+        if output == "video" and not is_video(session["name"], session["mime"]):
+            await query.answer(
+                "Ce fichier n'est pas identifié comme une vidéo.",
+                show_alert=True,
+            )
             return
 
-        # This is Telegram media-type selection, not transcoding.
-        # Only a document identified as a video can be sent as a video.
-        if output == "video" and session["kind"] == "document":
-            if not is_video_document(session["name"], session["mime"]):
-                await query.answer(
-                    "Ce fichier n'est pas identifié comme une vidéo.",
-                    show_alert=True,
-                )
-                return
-
-        await process_send(query.message, session_id, output)
+        await send_result(query.message, session_id, output)
 
 
-async def process_send(message, session_id: str, output: str):
+async def send_result(message, session_id: str, output: str):
     session = sessions.get(session_id)
-
     if not session:
         await message.reply_text("❌ Session expirée.")
         return
 
     status = await message.reply_text("📤 Préparation du fichier...")
 
-    local_path = None
+    source_path = None
     try:
         tg_file = await message.get_bot().get_file(session["file_id"])
 
-        # With the Local Bot API, getFile returns a local path.
-        # download_to_drive() can therefore copy it to our own working path.
-        local_path = TMP_DIR / f"{message.chat_id}_{session_id.replace(':', '_')}"
-        result = await tg_file.download_to_drive(custom_path=local_path)
+        # In Local Bot API mode, file_path is an absolute path on the SAME
+        # container. download_to_drive() returns that path without copying it.
+        source_path = await tg_file.download_to_drive()
 
-        if result and Path(result).exists():
-            local_path = Path(result)
+        source_path = Path(source_path)
+        if not source_path.exists():
+            raise RuntimeError(f"Fichier local introuvable: {source_path}")
 
-        actual_size = local_path.stat().st_size
+        actual_size = source_path.stat().st_size
         if actual_size > MAX_BYTES:
             raise RuntimeError("Le fichier dépasse la limite de 2 Go.")
 
-        new_name = clean_name(session["name"])
+        # Rename only at the upload layer. No transcoding.
+        new_name = clean_name(session["new_name"])
 
         await status.edit_text(
-            "📤 Uploading file...\n\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "Préparation terminée.\n"
-            "━━━━━━━━━━━━━━━━"
+            "📤 UPLOADING FILE...\n\n"
+            f"📁 {new_name}\n"
+            f"📦 {human_size(actual_size)}\n\n"
+            "⚙️ Transfert en cours..."
         )
 
-        # In this first clean version, video/document are two Telegram
-        # output types for the same bytes. No transcoding is performed.
-        with local_path.open("rb") as stream:
-            if output == "video":
-                await message.get_bot().send_video(
-                    chat_id=message.chat_id,
-                    video=stream,
-                    caption=f"📁 {new_name}",
-                    supports_streaming=True,
-                )
-            else:
-                await message.get_bot().send_document(
-                    chat_id=message.chat_id,
-                    document=stream,
-                    caption=f"📁 {new_name}",
-                )
+        thumbnail_id = get_thumbnail(session["user_id"])
+
+        # Telegram thumbnail file_ids cannot be directly reused as upload
+        # thumbnails. The permanent thumbnail will be wired to the local
+        # file in the next step after the 2 GiB transfer path is validated.
+        # We intentionally do not fake this here.
+        if output == "video":
+            await message.get_bot().send_video(
+                chat_id=message.chat_id,
+                video=source_path,
+                filename=new_name,
+                supports_streaming=True,
+                caption=f"📁 {new_name}",
+            )
+        else:
+            await message.get_bot().send_document(
+                chat_id=message.chat_id,
+                document=source_path,
+                filename=new_name,
+                caption=f"📁 {new_name}",
+            )
 
         await status.edit_text("✅ Fichier envoyé avec succès.")
 
     except Exception as exc:
         await status.edit_text(
-            "❌ Erreur pendant le traitement.\n\n"
+            "❌ ERREUR PENDANT LE TRAITEMENT\n\n"
             f"{type(exc).__name__}: {exc}"
         )
 
     finally:
-        if local_path:
-            try:
-                Path(local_path).unlink(missing_ok=True)
-            except Exception:
-                pass
-
+        # Telegram Local Bot API owns the downloaded file. Do not delete it
+        # here; the Local API manages its own storage.
         sessions.pop(session_id, None)
 
 
-async def ignored_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Audio, voice and animations are intentionally not processed.
+async def ignored_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return
 
 
-def build_application():
-    builder = Application.builder().token(BOT_TOKEN)
-
-    if LOCAL_API:
-        builder = (
-            builder
-            .base_url(API_BASE_URL)
-            .base_file_url(API_FILE_BASE_URL)
-            .local_mode(True)
-        )
-
-    app = builder.build()
+def build_app():
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .base_url(API_BASE_URL)
+        .base_file_url(API_FILE_BASE_URL)
+        .local_mode(True)
+        .build()
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
@@ -437,7 +393,7 @@ def build_application():
     app.add_handler(
         MessageHandler(
             filters.AUDIO | filters.VOICE | filters.ANIMATION,
-            ignored_media,
+            ignored_handler,
         )
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
@@ -447,24 +403,9 @@ def build_application():
 
 
 def main():
-    app = build_application()
-
-    port = int(os.getenv("PORT", "8080"))
-    render_url = os.getenv("RENDER_EXTERNAL_URL")
-
-    if render_url:
-        webhook_url = f"{render_url.rstrip('/')}/telegram"
-        print(f"Starting webhook on port {port}: {webhook_url}")
-
-        app.run_webhook(
-            listen="0.0.0.0",
-            port=port,
-            url_path="telegram",
-            webhook_url=webhook_url,
-        )
-    else:
-        print("Starting polling")
-        app.run_polling()
+    print(f"Dash Renamer starting with Local Bot API at {API_BASE_URL}")
+    print(f"Maximum file size: {MAX_BYTES} bytes (2 GiB)")
+    build_app().run_polling()
 
 
 if __name__ == "__main__":
