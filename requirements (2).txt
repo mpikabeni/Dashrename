@@ -1,5 +1,6 @@
 pyrofork
 tgcrypto
+uvloop
 asyncpg
 pillow
 aiohttp
