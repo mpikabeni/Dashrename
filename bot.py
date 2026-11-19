@@ -1,3 +1,4 @@
+import html
 import os
 import re
 import time
@@ -11,7 +12,7 @@ import asyncpg
 from aiohttp import web, ClientSession
 from PIL import Image
 from pyrogram import Client, filters, idle, StopPropagation
-from pyrogram.enums import ChatAction, ChatMemberStatus
+from pyrogram.enums import ChatAction, ChatMemberStatus, ParseMode
 from pyrogram.errors import (
     FloodWait, UserNotParticipant, UserIsBlocked, InputUserDeactivated, PeerIdInvalid,
 )
@@ -50,6 +51,37 @@ app = Client(
     max_concurrent_transmissions=int(os.environ.get("MAX_TRANSMISSIONS", "16")),
     sleep_threshold=60,   # attend automatiquement les petits FloodWait
 )
+
+# ---------- Tous les messages du bot en gras ----------
+def _bold(text, parse_mode=None):
+    """Met tout le texte en gras (Markdown). Ignore les messages envoyés en HTML (légendes déjà en gras)."""
+    if not isinstance(text, str) or not text.strip():
+        return text
+    if parse_mode is not None and str(parse_mode).upper().endswith(("HTML", "DISABLED")):
+        return text
+    return "**" + text.replace("**", "") + "**"
+
+
+_send_message, _edit_message_text, _send_photo = Client.send_message, Client.edit_message_text, Client.send_photo
+
+
+async def _bold_send_message(self, chat_id, text, *a, **k):
+    return await _send_message(self, chat_id, _bold(text, k.get("parse_mode")), *a, **k)
+
+
+async def _bold_edit_message_text(self, chat_id, message_id, text, *a, **k):
+    return await _edit_message_text(self, chat_id, message_id, _bold(text, k.get("parse_mode")), *a, **k)
+
+
+async def _bold_send_photo(self, chat_id, photo, *a, **k):
+    if "caption" in k:
+        k["caption"] = _bold(k["caption"], k.get("parse_mode"))
+    return await _send_photo(self, chat_id, photo, *a, **k)
+
+
+Client.send_message = _bold_send_message
+Client.edit_message_text = _bold_edit_message_text
+Client.send_photo = _bold_send_photo
 
 # ---------- État en mémoire ----------
 pending = {}       # (user_id, id du message d'invite) -> {"msg", "mode", "thumb", "caption", "t"}
@@ -317,19 +349,6 @@ async def loading(m: Message, label: str) -> Message:
     msg = await m.reply_text(f"⏳ {label}")
     await animate(msg, [f"⌛ {label}.", f"⏳ {label}..", f"⌛ {label}..."], 0.4)
     return msg
-
-
-async def react(m: Message, emoji: str, big: bool = False):
-    """Réaction animée sur le message de l'utilisateur (sans jamais planter)."""
-    try:
-        await m.react(emoji, big=big)
-    except TypeError:
-        try:
-            await m.react(emoji)
-        except Exception:
-            pass
-    except Exception:
-        pass
 
 
 _bg_tasks = set()
@@ -1527,7 +1546,6 @@ async def got_file(_, m: Message):
         "caption": True,
         "t": time.time(),
     }
-    await react(m, "⚡")
     try:
         await m._client.send_chat_action(m.chat.id, ChatAction.TYPING)
     except Exception:
@@ -1754,6 +1772,7 @@ async def process(c: Client, uid: int, chat_id: int, st: dict, typed_name, statu
         size = os.path.getsize(path)
         if st["caption"]:
             caption = (u.get("caption") or "{filename}").replace("{filename}", new_name).replace("{size}", human(size))
+            caption = "<b>" + html.escape(caption.strip()) + "</b>"  # tout en gras
         else:
             caption = ""
 
@@ -1765,7 +1784,7 @@ async def process(c: Client, uid: int, chat_id: int, st: dict, typed_name, statu
         }
         start = time.time()
         args = dict(
-            chat_id=chat_id, thumb=thumb_path, caption=caption,
+            chat_id=chat_id, thumb=thumb_path, caption=caption, parse_mode=ParseMode.HTML,
             progress=progress, progress_args=(status, start, "Envoi", state),
         )
         if mode == "video":
@@ -1792,7 +1811,6 @@ async def process(c: Client, uid: int, chat_id: int, st: dict, typed_name, statu
             f"📦 **Taille :** {human(size)}",
             f"⏱ **Durée :** {fmt_time(time.time() - t0)}",
         ]) + "\n\n⚡ Dash Rename Bot")
-        _bg(react(src, "🎉", big=True))
     except asyncio.CancelledError:  # bouton « Annuler » pendant le transfert
         try:
             await settle(state)
