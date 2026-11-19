@@ -61,6 +61,7 @@ member_cache = {}  # user_id -> expiration du cache d'abonnement
 thumb_ids = {}     # user_id -> file_id de la miniature déjà sur disque
 ann = {}           # admin_id -> annonce en préparation
 stat = {"waiting": 0}
+jobs = {}          # (chat_id, id du message de statut) -> (user_id, tâche) : sert au bouton Annuler
 FLAGS = {"maintenance": False}
 SEM = None         # limite de renommages simultanés (créé dans main)
 LOGO_ID = None     # file_id du logo après le premier envoi
@@ -248,21 +249,10 @@ def card(title: str, lines: list, footer: str = None) -> str:
     return out
 
 
-def table(rows: list, kw: int = 11, vw: int = 26) -> str:
-    """Tableau à 2 colonnes (largeur fixe, donc il ne « saute » pas) dans un bloc de code."""
-    def cut(t, w):
-        t = code(t).replace("\n", " ")
-        return t if len(t) <= w else t[:w - 1] + "…"
-    top = "┌" + "─" * (kw + 2) + "┬" + "─" * (vw + 2) + "┐"
-    sep = "├" + "─" * (kw + 2) + "┼" + "─" * (vw + 2) + "┤"
-    end = "└" + "─" * (kw + 2) + "┴" + "─" * (vw + 2) + "┘"
-    body = f"\n{sep}\n".join(f"│ {cut(a, kw):<{kw}} │ {cut(b, vw):<{vw}} │" for a, b in rows)
-    return f"```\n{top}\n{body}\n{end}\n```"
-
-
-def tbar(pct: float, size: int = 10) -> str:
-    n = max(0, min(size, int(size * pct / 100)))
-    return "█" * n + "░" * (size - n) + f" {pct:5.1f}%"
+def panel(title: str, rows: list) -> str:
+    """Cadre Dash ┏━━ TITRE ━━ avec une ligne par information (côté droit ouvert)."""
+    body = "\n".join(f"┃ {r}" for r in rows)
+    return f"┏━━ {title} ━━━━━━━━━━\n{body}\n┗━━━━━━━━━━━━━━━━━━━━"
 
 
 def fancy_bar(pct: float, size: int = 12) -> str:
@@ -343,6 +333,7 @@ async def react(m: Message, emoji: str, big: bool = False):
 
 
 _bg_tasks = set()
+CANCEL_KB = InlineKeyboardMarkup([[InlineKeyboardButton("❌ ANNULER", callback_data="jobcancel")]])
 
 
 def _bg(coro):
@@ -363,19 +354,23 @@ async def push_progress(current, total, msg: Message, start: float, label: str, 
         pct = current * 100 / max(total, 1)
         speed = current / max(now - start, 0.1)
         eta = int((total - current) / speed) if speed else 0
+        pct = min(pct, 100.0)
+        n = int(14 * pct / 100)
+        bar = "▰" * n + "▱" * (14 - n)
+        mbps = speed / (1024 * 1024)
+        icon = "🐢" if mbps < 5 else "🐇" if mbps < 20 else "🚀"
+        head = "📤 **Envoi**" if label == "Envoi" else "📥 **Téléchargement**"
         rows = []
         if state.get("name"):
-            rows.append(("Fichier", state["name"]))
+            rows.append(f"📁 `{state['name']}`")
         rows += [
-            ("Étape", label),
-            ("Progression", tbar(pct)),
-            ("Taille", f"{human(current)} / {human(total)}"),
-            ("Vitesse", f"{human(speed)}/s"),
-            ("Restant", fmt_eta(eta)),
+            f"📦 {human(current)} / {human(total)}",
+            f"{icon} {human(speed)}/s",
+            f"⏳ {fmt_eta(eta)} restant",
         ]
-        text = f"{RUN[i % 4]} **EN COURS**{DOTS[i % 4]}\n{table(rows)}"
+        text = f"⚡ **DASH** · {head}\n\n`{bar}`  **{pct:.1f}%**\n\n" + panel("PROGRESSION", rows)
         try:
-            await msg.edit_text(text)
+            await msg.edit_text(text, reply_markup=CANCEL_KB)
         except Exception:
             pass
         action = state.get("action")  # indicateur « envoie une vidéo… » en haut du chat
@@ -587,7 +582,7 @@ HELP = card("⚡ DASH RENAME BOT", [
     "**Comment ça marche**",
     "1️⃣ Envoie un fichier, une vidéo ou un audio",
     "2️⃣ Choisis les options avec les boutons",
-    "3️⃣ Envoie le nouveau nom (ou « Garder le nom »)",
+    "3️⃣ Envoie le nouveau nom en répondant au message",
     "",
     "**Commandes**",
     "🖼 /setthumb · /delthumb · /thumb — miniature (ou envoie une photo)",
@@ -661,6 +656,25 @@ def menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("❓ Aide", callback_data="menu:help")] + channel_row(),
     ]
     return InlineKeyboardMarkup(rows)
+
+
+SUPPORT = os.environ.get("SUPPORT", "Nexa_CG").lstrip("@")
+
+
+def start_keyboard() -> InlineKeyboardMarkup:
+    top = []
+    if FORCE_CHANNEL:
+        top.append(InlineKeyboardButton("📢 Mises à jour", url=f"https://t.me/{FORCE_CHANNEL}"))
+    top.append(InlineKeyboardButton("💬 Support", url=f"https://t.me/{SUPPORT}"))
+    return InlineKeyboardMarkup([
+        top,
+        [InlineKeyboardButton("ℹ️ À propos", callback_data="menu:about"),
+         InlineKeyboardButton("❓ Aide", callback_data="menu:help")],
+        [InlineKeyboardButton("🖼 Miniature", callback_data="menu:thumb"),
+         InlineKeyboardButton("💬 Légende", callback_data="menu:caption")],
+        [InlineKeyboardButton("🏷 Préfixe", callback_data="menu:prefix"),
+         InlineKeyboardButton("📊 Mes stats", callback_data="menu:stats")],
+    ])
 
 
 def admin_keyboard() -> InlineKeyboardMarkup:
@@ -1159,7 +1173,7 @@ async def ann_cb(c: Client, q):
 # =====================================================================
 #  UTILISATEURS — accueil, réglages, commandes
 # =====================================================================
-async def send_welcome(c: Client, chat_id: int, intro: bool = True):
+async def send_welcome(c: Client, chat_id: int, intro: bool = True, name: str = None):
     """Animation de chargement, puis logo + présentation + menu."""
     global LOGO_ID
     if intro:
@@ -1173,13 +1187,21 @@ async def send_welcome(c: Client, chat_id: int, intro: bool = True):
             await msg.delete()
         except Exception:
             pass
-    caption = card("⚡ DASH RENAME BOT", [
-        "Renomme tes fichiers et vidéos, change leur miniature —",
-        "jusqu'à **2 Go**, à vitesse éclair 🚀",
-        "",
-        "📤 **Envoie-moi un fichier pour commencer**",
-    ], footer="by Nexa · @Nexa_CG")
-    kb = menu_keyboard()
+    hello = f"👋 **Bonjour, {safe(name)} !**\n\n" if name else ""
+    caption = (
+        hello
+        + "Bienvenue sur **Dash**, le bot de renommage rapide et simple.\n\n"
+        "📤 **Envoie-moi un fichier pour commencer.**\n\n"
+        "🛠 **Fonctions :**\n"
+        "• Renommage rapide (jusqu'à **2 Go**)\n"
+        "• Renommage groupé de plusieurs fichiers\n"
+        "• Légendes personnalisées\n"
+        "• Miniature permanente\n"
+        "• Conversion fichier ↔ vidéo ↔ audio\n\n"
+        "🌟 __Rapide comme l'éclair !__\n\n"
+        "⚡ by Nexa · @Nexa_CG"
+    )
+    kb = start_keyboard()
     if LOGO_ID or os.path.exists(LOGO_PATH):
         try:
             sent = await c.send_photo(chat_id, LOGO_ID or LOGO_PATH, caption=caption, reply_markup=kb)
@@ -1192,7 +1214,7 @@ async def send_welcome(c: Client, chat_id: int, intro: bool = True):
 
 @app.on_message(filters.command("start") & filters.private)
 async def start(c: Client, m: Message):
-    await send_welcome(c, m.chat.id)
+    await send_welcome(c, m.chat.id, name=m.from_user.first_name)
 
 
 @app.on_message(filters.command("help") & filters.private)
@@ -1221,7 +1243,7 @@ async def checksub_cb(c: Client, q):
             await q.message.delete()
         except Exception:
             pass
-        await send_welcome(c, q.message.chat.id)
+        await send_welcome(c, q.message.chat.id, name=q.from_user.first_name)
     else:
         await q.answer("❌ Tu n'as pas encore rejoint le canal.", show_alert=True)
 
@@ -1243,6 +1265,14 @@ async def menu_cb(c: Client, q):
     await q.answer()
     if act == "stats":
         await c.send_message(chat, me_text(u))
+    elif act == "about":
+        await c.send_message(chat, card("ℹ️ À PROPOS", [
+            "⚡ **Dash Rename Bot**",
+            "Renommage de fichiers rapide et simple, jusqu'à **2 Go**.",
+            "",
+            "• Renommage groupé · Miniature · Légende · Préfixe",
+            "• Conversion fichier ↔ vidéo ↔ audio",
+        ], footer="by Nexa · @Nexa_CG"))
     elif act == "help":
         await c.send_message(chat, HELP)
     elif act == "thumb":
@@ -1352,7 +1382,7 @@ async def go_all(c: Client, m: Message):
             await c.delete_messages(m.chat.id, k[1])
         except Exception:
             pass
-        status = await m.reply_text("🚀 Démarrage…")
+        status = await st["msg"].reply_text("🚀 Démarrage…", quote=True)
         asyncio.create_task(process(c, uid, m.chat.id, st, None, status))
 
 
@@ -1389,7 +1419,7 @@ async def launch_one(c: Client, m: Message, uid: int, key: tuple, name):
         await c.delete_messages(m.chat.id, key[1])
     except Exception:
         pass
-    status = await m.reply_text("🚀 Démarrage…")
+    status = await st["msg"].reply_text("🚀 Démarrage…", quote=True)
     asyncio.create_task(process(c, uid, m.chat.id, st, name, status))
     await asyncio.sleep(0.5)  # évite le flood quand il y a beaucoup de fichiers
 
@@ -1443,33 +1473,37 @@ def keyboard(st: dict) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton(lab("document", "📄 Fichier"), callback_data="mode:document"),
             InlineKeyboardButton(lab("video", "🎬 Vidéo"), callback_data="mode:video"),
-            InlineKeyboardButton(lab("audio", "🎵 Audio"), callback_data="mode:audio"),
         ],
         [
             InlineKeyboardButton(f"🖼 Miniature : {onoff(st['thumb'])}", callback_data="thumb"),
             InlineKeyboardButton(f"💬 Légende : {onoff(st['caption'])}", callback_data="cap"),
         ],
-        [
-            InlineKeyboardButton("⚡ Garder le nom", callback_data="keep"),
-            InlineKeyboardButton("❌ Annuler", callback_data="cancel"),
-        ],
+        [InlineKeyboardButton("❌ Annuler", callback_data="cancel")],
     ])
 
 
 def prompt_text(media, waiting: int = 1) -> str:
+    name = media.file_name or "—"
+    ext = name.rsplit(".", 1)[1].upper() if "." in name else "—"
+    kind = "🎥" if getattr(media, "duration", None) and hasattr(media, "width") else "🎵" if hasattr(media, "performer") else "📄"
     lines = [
-        f"📁 Actuel : `{safe(media.file_name)}`",
-        f"📦 Taille : `{human(media.file_size or 0)}`",
+        f"{kind} **MEDIA INFO :**",
         "",
-        "1️⃣ Choisis les options ci-dessous",
-        "2️⃣ **Réponds à ce message** avec le nouveau nom",
-        "   (avec ou sans extension) ou appuie sur « ⚡ Garder le nom »",
+        f"🗃 **Ancien nom :** `{code(name)}`",
+        "",
+        f"🏷 **Extension :** {ext}",
+        f"📏 **Taille :** {human(media.file_size or 0)}",
+        f"🧬 **Type MIME :** `{code(getattr(media, 'mime_type', None) or '—')}`",
+        f"🆔 **DC ID :** {getattr(media, 'dc_id', None) or '—'}",
+        "",
+        "✏️ **Choisis les options, puis envoie le nouveau nom** (avec ou sans extension)",
+        "en **répondant à ce message**.",
     ]
     if waiting > 1:
         lines += ["", f"📚 `{waiting}` fichiers en attente",
                   "• /go = tout lancer avec les noms d'origine",
                   "• /rename `modèle` = tout renommer d'un coup (ex : `/rename Film {n:02}`)"]
-    return card("📝 NOUVEAU NOM", lines)
+    return "\n".join(lines)
 
 
 @app.on_message((filters.document | filters.video | filters.audio) & filters.private)
@@ -1498,11 +1532,22 @@ async def got_file(_, m: Message):
         await m._client.send_chat_action(m.chat.id, ChatAction.TYPING)
     except Exception:
         pass
-    prompt = await m.reply_text(prompt_text(media, len(user_keys(uid)) + 1), reply_markup=keyboard(st))
+    prompt = await m.reply_text(prompt_text(media, len(user_keys(uid)) + 1), reply_markup=keyboard(st), quote=True)
     pending[(uid, prompt.id)] = st
 
 
-@app.on_callback_query(filters.regex(r"^(mode:|thumb$|cap$|keep$|cancel$)"))
+@app.on_callback_query(filters.regex(r"^jobcancel$"))
+async def jobcancel_cb(c: Client, q):
+    if not await cb_allowed(c, q):
+        return
+    job = jobs.get((q.message.chat.id, q.message.id))
+    if not job or (job[0] != q.from_user.id and q.from_user.id not in ADMINS):
+        return await q.answer("Ce traitement est déjà terminé.", show_alert=True)
+    job[1].cancel()
+    await q.answer("❌ Annulation en cours…")
+
+
+@app.on_callback_query(filters.regex(r"^(mode:|thumb$|cap$|cancel$)"))
 async def options_cb(c: Client, q):
     if not await cb_allowed(c, q):
         return
@@ -1526,12 +1571,6 @@ async def options_cb(c: Client, q):
         pending.pop(key, None)
         await q.message.edit_text("❌ Opération annulée.")
         return await q.answer()
-    elif d == "keep":
-        pending.pop(key, None)
-        await q.answer("C'est parti ⚡")
-        status = await q.message.edit_text("🚀 Démarrage…")
-        return asyncio.create_task(process(c, uid, q.message.chat.id, st, None, status))
-
     try:
         await q.message.edit_reply_markup(keyboard(st))
     except Exception:
@@ -1562,7 +1601,7 @@ async def got_name(c: Client, m: Message):
         await c.delete_messages(m.chat.id, key[1])  # retire l'invite et ses boutons
     except Exception:
         pass
-    status = await m.reply_text("🚀 Démarrage…")
+    status = await st["msg"].reply_text("🚀 Démarrage…", quote=True)
     asyncio.create_task(process(c, uid, m.chat.id, st, m.text, status))
 
 
@@ -1661,25 +1700,36 @@ async def process(c: Client, uid: int, chat_id: int, st: dict, typed_name, statu
         new_name += "." + old_name.rsplit(".", 1)[1]
     new_name = (u.get("prefix") or "") + new_name
 
+    jkey = (chat_id, status.id)
+    jobs[jkey] = (uid, asyncio.current_task())
     t0 = time.time()
     usem = usems.setdefault(uid, asyncio.Semaphore(MAX_PER_USER))
     waiting = usem.locked() or SEM.locked()
     if waiting:  # file d'attente : limite par utilisateur puis limite globale
         stat["waiting"] += 1
         try:
-            await status.edit_text("⏳ **FILE D'ATTENTE**\n" + table([
-                ("Fichier", safe(new_name)),
-                ("Statut", "En attente"),
-                ("En cours", f"{n_active()} fichier(s)"),
-                ("Démarrage", "Automatique"),
-            ]))
+            await status.edit_text("⏳ **EN FILE D'ATTENTE**\n\n" + panel("ATTENTE", [
+                f"📁 **Fichier :** `{safe(new_name)}`",
+                f"⚙️ **En cours :** {n_active()} fichier(s)",
+                "🚀 Démarrage automatique",
+            ]), reply_markup=CANCEL_KB)
         except Exception:
             pass
-    await usem.acquire()
+    got_u = False
     try:
+        await usem.acquire()
+        got_u = True
         await SEM.acquire()
-    except BaseException:
-        usem.release()
+    except BaseException as e:
+        if got_u:
+            usem.release()
+        jobs.pop(jkey, None)
+        if isinstance(e, asyncio.CancelledError):  # annulé pendant l'attente
+            try:
+                await status.edit_text("❌ **Annulé**\n\n" + panel("ANNULÉ", [f"📁 **Fichier :** `{safe(new_name)}`"]))
+            except Exception:
+                pass
+            return
         raise
     finally:
         if waiting:
@@ -1737,19 +1787,26 @@ async def process(c: Client, uid: int, chat_id: int, st: dict, typed_name, statu
         ucache.pop(uid, None)
         _bg(execute("UPDATE users SET renamed = renamed + 1, bytes = bytes + $1 WHERE id=$2", size, uid))
         _bg(bump_daily(files=1, size=size))
-        await status.edit_text("🎉 **TERMINÉ !**\n" + table([
-            ("Fichier", safe(new_name)),
-            ("Statut", "Terminé"),
-            ("Taille", human(size)),
-            ("Durée", fmt_time(time.time() - t0)),
-        ]) + "\n⚡ Dash Rename Bot")
+        await status.edit_text("🎉 **TERMINÉ !**\n\n" + panel("RÉSUMÉ", [
+            f"📁 **Fichier :** `{safe(new_name)}`",
+            f"📦 **Taille :** {human(size)}",
+            f"⏱ **Durée :** {fmt_time(time.time() - t0)}",
+        ]) + "\n\n⚡ Dash Rename Bot")
         _bg(react(src, "🎉", big=True))
+    except asyncio.CancelledError:  # bouton « Annuler » pendant le transfert
+        try:
+            await settle(state)
+            await status.edit_text("❌ **Annulé**\n\n" + panel("ANNULÉ", [
+                f"📁 **Fichier :** `{safe(new_name)}`", "🧹 Fichiers temporaires supprimés"]))
+        except Exception:
+            pass
     except Exception as e:
         try:
             await status.edit_text(card("❌ ERREUR", [f"`{safe(e)[:200]}`", "", "Réessaie ou contacte l'admin."]))
         except Exception:
             pass
     finally:
+        jobs.pop(jkey, None)
         active[uid] = active.get(uid, 1) - 1
         if active[uid] <= 0:
             active.pop(uid, None)
