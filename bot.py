@@ -566,7 +566,31 @@ ANN_HELP = card("📢 ANNONCES", [
     "Un aperçu s'affiche avant l'envoi (test, épingler, confirmer).",
 ], footer="Alias : /broadcast")
 
-ADMIN_TEXT = card("🛠 PANNEAU ADMIN", ["Choisis une action 👇"], footer="Dash Rename Bot · Nexa")
+def admin_text() -> str:
+    return card("🛠 PANNEAU ADMIN", [
+        f"🔧 Maintenance : **{'ON' if FLAGS['maintenance'] else 'OFF'}**",
+        f"⚙️ En cours : `{n_active()}` · ⏳ En attente : `{stat['waiting']}`",
+        f"⏱ Uptime : `{fmt_time(time.time() - START)}`",
+        "",
+        "Choisis une action 👇",
+    ], footer="Dash Rename Bot · Nexa")
+
+
+ADMIN_HELP = card("📖 COMMANDES ADMIN", [
+    "**Panneau & statistiques**",
+    "/admin — panneau · /stats · /server · /daily · /top",
+    "",
+    "**Utilisateurs** (id ou @pseudo)",
+    "/user `id` — fiche d'un utilisateur",
+    "/ban `id` · /unban `id` · /banlist",
+    "/purge `30` — supprime les inactifs depuis 30 jours",
+    "",
+    "**Annonces**",
+    "/announce — aide et envoi · /history — historique",
+    "",
+    "**Serveur**",
+    "/maintenance `on` ou `off` · /clean",
+], footer="Alias : /sys /week /broadcast")
 
 
 # =====================================================================
@@ -596,8 +620,9 @@ def admin_keyboard() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🏆 Top", callback_data="adm:top")],
         [InlineKeyboardButton("📢 Annonces", callback_data="adm:ann"),
          InlineKeyboardButton("📜 Historique", callback_data="adm:history")],
-        [InlineKeyboardButton("🧹 Nettoyer", callback_data="adm:clean"),
-         InlineKeyboardButton("🚫 Bannis", callback_data="adm:banlist")],
+        [InlineKeyboardButton("🚫 Bannis", callback_data="adm:banlist"),
+         InlineKeyboardButton("🧹 Nettoyer", callback_data="adm:clean")],
+        [InlineKeyboardButton("📖 Commandes", callback_data="adm:help")],
         [InlineKeyboardButton(maint, callback_data="adm:maint")],
     ])
 
@@ -697,7 +722,12 @@ async def cb_allowed(c: Client, q) -> bool:
 # =====================================================================
 @app.on_message(filters.command("admin") & filters.private & is_admin)
 async def admin_panel(_, m: Message):
-    await m.reply_text(ADMIN_TEXT, reply_markup=admin_keyboard())
+    await m.reply_text(admin_text(), reply_markup=admin_keyboard())
+
+
+@app.on_message(filters.command("adminhelp") & filters.private & is_admin)
+async def admin_help(_, m: Message):
+    await m.reply_text(ADMIN_HELP)
 
 
 @app.on_callback_query(filters.regex(r"^adm:") & is_admin)
@@ -706,7 +736,7 @@ async def adm_cb(c: Client, q):
     await q.answer()
     kb = BACK_KB
     if act == "home":
-        text, kb = ADMIN_TEXT, admin_keyboard()
+        text, kb = admin_text(), admin_keyboard()
     elif act == "stats":
         text = await stats_text()
     elif act == "server":
@@ -721,12 +751,14 @@ async def adm_cb(c: Client, q):
         text = await banlist_text()
     elif act == "ann":
         text = ANN_HELP
+    elif act == "help":
+        text = ADMIN_HELP
     elif act == "clean":
         n, freed = clean_downloads(max_age=10800 if n_active() else 0)
         text = card("🧹 NETTOYAGE", [f"🗂 Dossiers supprimés : `{n}`", f"💾 Libéré : `{human(freed)}`"])
     elif act == "maint":
         FLAGS["maintenance"] = not FLAGS["maintenance"]
-        text, kb = ADMIN_TEXT, admin_keyboard()
+        text, kb = admin_text(), admin_keyboard()
     else:
         return
     try:
@@ -767,11 +799,22 @@ async def banlist(_, m: Message):
     await m.reply_text(await banlist_text())
 
 
+async def resolve_uid(m: Message):
+    """Accepte un id numérique ou un @pseudo déjà connu du bot."""
+    if len(m.command) < 2:
+        return None
+    arg = m.command[1].lstrip("@")
+    if arg.isdigit():
+        return int(arg)
+    return await fetchval("SELECT id FROM users WHERE lower(username)=lower($1)", arg)
+
+
 @app.on_message(filters.command("user") & filters.private & is_admin)
 async def user_info(_, m: Message):
-    if len(m.command) < 2 or not m.command[1].isdigit():
-        return await m.reply_text("Usage : `/user user_id`")
-    await m.reply_text(await user_text(int(m.command[1])))
+    uid = await resolve_uid(m)
+    if not uid:
+        return await m.reply_text("Usage : `/user id` ou `/user @pseudo` (utilisateur connu du bot)")
+    await m.reply_text(await user_text(uid))
 
 
 @app.on_message(filters.command("maintenance") & filters.private & is_admin)
@@ -833,9 +876,11 @@ async def purge_cb(_, q):
 
 @app.on_message(filters.command("ban") & filters.private & is_admin)
 async def ban(_, m: Message):
-    if len(m.command) < 2 or not m.command[1].isdigit():
-        return await m.reply_text("Usage : `/ban user_id`")
-    uid = int(m.command[1])
+    uid = await resolve_uid(m)
+    if not uid:
+        return await m.reply_text("Usage : `/ban id` ou `/ban @pseudo` (utilisateur connu du bot)")
+    if uid in ADMINS:
+        return await m.reply_text("⚠️ Impossible de bannir un admin.")
     await execute(
         """
         INSERT INTO users (id, joined, last_seen, banned) VALUES ($1, $2, $2, TRUE)
@@ -849,12 +894,21 @@ async def ban(_, m: Message):
 
 @app.on_message(filters.command("unban") & filters.private & is_admin)
 async def unban(_, m: Message):
-    if len(m.command) < 2 or not m.command[1].isdigit():
-        return await m.reply_text("Usage : `/unban user_id`")
-    uid = int(m.command[1])
+    uid = await resolve_uid(m)
+    if not uid:
+        return await m.reply_text("Usage : `/unban id` ou `/unban @pseudo` (utilisateur connu du bot)")
     await execute("UPDATE users SET banned=FALSE WHERE id=$1", uid)
     ucache.pop(uid, None)
     await m.reply_text(f"✅ `{uid}` débanni.")
+
+
+ADMIN_ONLY_CMDS = ["admin", "adminhelp", "stats", "server", "sys", "daily", "week", "top", "history",
+                   "banlist", "user", "maintenance", "clean", "purge", "ban", "unban", "announce", "broadcast"]
+
+
+@app.on_message(filters.command(ADMIN_ONLY_CMDS) & filters.private & ~is_admin)
+async def not_admin(_, m: Message):
+    await m.reply_text("⛔ Cette commande est réservée aux admins.")
 
 
 # ---------- Annonces (texte, images, vidéos…) ----------
@@ -1647,6 +1701,7 @@ USER_COMMANDS = [
 ]
 ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand("admin", "Panneau admin"),
+    BotCommand("adminhelp", "Liste des commandes admin"),
     BotCommand("stats", "Statistiques"),
     BotCommand("server", "État du serveur"),
     BotCommand("daily", "7 derniers jours"),
