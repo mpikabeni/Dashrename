@@ -371,7 +371,7 @@ async def push_progress(current, total, msg: Message, start: float, label: str, 
         state["i"] = state.get("i", 0) + 1
         i = state["i"]
         pct = current * 100 / max(total, 1)
-        speed = current / max(now - start, 0.1)
+        speed = state.get("speed") or current / max(now - start, 0.1)  # vitesse réelle (fenêtre glissante)
         eta = int((total - current) / speed) if speed else 0
         pct = min(pct, 100.0)
         n = int(14 * pct / 100)
@@ -406,6 +406,12 @@ async def progress(current, total, msg: Message, start: float, label: str, state
     """Appelé à chaque morceau : ne fait que lancer la mise à jour en tâche de fond,
     donc le transfert n'attend jamais Telegram pour afficher la progression."""
     now = time.time()
+    win = state.setdefault("win", [])  # vitesse sur les 5 dernières secondes, pas la moyenne depuis le début
+    win.append((now, current))
+    while len(win) > 2 and now - win[0][0] > 5:
+        win.pop(0)
+    if now - win[0][0] >= 0.5:
+        state["speed"] = (current - win[0][1]) / (now - win[0][0])
     if state.get("busy") or (now - state.get("last", 0) < 2.5 and current != total):
         return
     state["last"] = now
